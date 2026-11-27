@@ -16,9 +16,6 @@ concurrency:
 jobs:
   release:
     runs-on: windows-2022
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,9 +25,6 @@ jobs:
       - name: Init required submodules
         shell: powershell
         run: git submodule update --init --recursive third_party/minhook
-
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache NuGet packages
         uses: actions/cache@v4
