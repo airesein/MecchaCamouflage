@@ -97,6 +97,10 @@ function Invoke-VsToolCommand {
             if ($sccache) {
                 $compiler = (Get-Command $ToolName -ErrorAction Stop).Source
                 & $sccache.Source $compiler @ToolArgs
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "sccache failed for $ToolName; retrying without the compiler cache."
+                    & $ToolName @ToolArgs
+                }
             }
             else {
                 & $ToolName @ToolArgs
@@ -139,6 +143,10 @@ function Invoke-VsToolCapture {
             if ($sccache) {
                 $compiler = (Get-Command $ToolName -ErrorAction Stop).Source
                 $output = & $sccache.Source $compiler @ToolArgs 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "sccache failed for $ToolName; retrying without the compiler cache."
+                    $output = & $ToolName @ToolArgs 2>&1
+                }
             }
             else {
                 $output = & $ToolName @ToolArgs 2>&1
