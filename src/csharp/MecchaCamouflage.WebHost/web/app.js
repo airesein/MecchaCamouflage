@@ -2367,9 +2367,12 @@ async function exportCurrentPaint() {
 }
 
 async function reuseCurrentPaint() {
-  if (!lastPaintExportManifest) throw new Error(i18n("error.image.export.none"));
-  const result = await send("importCurrentPaint", { manifestPath: lastPaintExportManifest }, 180000);
+  const typedPath = byId("image-export-path").value.trim();
+  const manifestPath = typedPath || lastPaintExportManifest;
+  if (!manifestPath) throw new Error(i18n("error.image.export.none"));
+  const result = await send("importCurrentPaint", { manifestPath }, 180000);
   if (!result?.success) throw new Error(result?.message || "The saved paint could not be reused.");
+  lastPaintExportManifest = manifestPath;
   toast(i18n("toast.image.export.reused"));
 }
 

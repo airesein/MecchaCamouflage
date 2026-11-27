@@ -16,12 +16,35 @@ concurrency:
 jobs:
   release:
     runs-on: windows-2022
+    env:
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      - name: Init required submodules
+        shell: powershell
+        run: git submodule update --init --recursive third_party/minhook
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj','Directory.Build.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Cache WebView2 bootstrapper
+        uses: actions/cache@v4
+        with:
+          path: .build/cache
+          key: webview2-${{ runner.os }}-${{ hashFiles('scripts/build.ps1') }}
+          restore-keys: webview2-${{ runner.os }}-
 
       - name: Resolve build identity
         shell: powershell
@@ -45,7 +68,7 @@ jobs:
 
       - name: Build runtime
         shell: powershell
-        run: .\scripts\build.ps1 -Version $env:RELEASE_VERSION
+        run: .\scripts\build.ps1 -Version $env:RELEASE_VERSION -ShowTimings
 
       - name: Package runtime
         shell: powershell

@@ -84,8 +84,23 @@ function Invoke-VsToolCommand {
     )
     $pushed = Push-NativeToolWorkingDirectory
     try {
+        $sccache = $null
+        if ($ToolName -eq "cl.exe") {
+            foreach ($arg in $ToolArgs) {
+                if ($arg -eq "/c" -or $arg -eq "-c") {
+                    $sccache = Get-Command "sccache" -ErrorAction SilentlyContinue
+                    break
+                }
+            }
+        }
         if (Get-Command $ToolName -ErrorAction SilentlyContinue) {
-            & $ToolName @ToolArgs
+            if ($sccache) {
+                $compiler = (Get-Command $ToolName -ErrorAction Stop).Source
+                & $sccache.Source $compiler @ToolArgs
+            }
+            else {
+                & $ToolName @ToolArgs
+            }
             if ($LASTEXITCODE -ne 0) { throw "$ToolName failed with exit code $LASTEXITCODE" }
             return
         }
@@ -94,7 +109,8 @@ function Invoke-VsToolCommand {
             throw "$ToolName was not found. Install Visual Studio 2022 Build Tools or run from a VS Developer PowerShell."
         }
         $ArgText = ($ToolArgs | ForEach-Object { Quote-CmdArg $_ }) -join " "
-        $CommandLine = "$(Quote-CmdArg $VsDevCmd) -arch=x64 -host_arch=x64 >nul && $ToolName $ArgText"
+        $toolPrefix = if ($sccache) { (Quote-CmdArg $sccache.Source) + " " } else { "" }
+        $CommandLine = "$(Quote-CmdArg $VsDevCmd) -arch=x64 -host_arch=x64 >nul && $toolPrefix$ToolName $ArgText"
         cmd /d /c $CommandLine
         if ($LASTEXITCODE -ne 0) { throw "$ToolName failed with exit code $LASTEXITCODE" }
     }
@@ -110,8 +126,23 @@ function Invoke-VsToolCapture {
     )
     $pushed = Push-NativeToolWorkingDirectory
     try {
+        $sccache = $null
+        if ($ToolName -eq "cl.exe") {
+            foreach ($arg in $ToolArgs) {
+                if ($arg -eq "/c" -or $arg -eq "-c") {
+                    $sccache = Get-Command "sccache" -ErrorAction SilentlyContinue
+                    break
+                }
+            }
+        }
         if (Get-Command $ToolName -ErrorAction SilentlyContinue) {
-            $output = & $ToolName @ToolArgs 2>&1
+            if ($sccache) {
+                $compiler = (Get-Command $ToolName -ErrorAction Stop).Source
+                $output = & $sccache.Source $compiler @ToolArgs 2>&1
+            }
+            else {
+                $output = & $ToolName @ToolArgs 2>&1
+            }
             if ($LASTEXITCODE -ne 0) { throw "$ToolName failed with exit code $LASTEXITCODE`n$output" }
             return $output
         }
@@ -120,7 +151,8 @@ function Invoke-VsToolCapture {
             throw "$ToolName was not found. Install Visual Studio 2022 Build Tools or run from a VS Developer PowerShell."
         }
         $ArgText = ($ToolArgs | ForEach-Object { Quote-CmdArg $_ }) -join " "
-        $CommandLine = "$(Quote-CmdArg $VsDevCmd) -arch=x64 -host_arch=x64 >nul && $ToolName $ArgText"
+        $toolPrefix = if ($sccache) { (Quote-CmdArg $sccache.Source) + " " } else { "" }
+        $CommandLine = "$(Quote-CmdArg $VsDevCmd) -arch=x64 -host_arch=x64 >nul && $toolPrefix$ToolName $ArgText"
         $output = cmd /d /c $CommandLine 2>&1
         if ($LASTEXITCODE -ne 0) { throw "$ToolName failed with exit code $LASTEXITCODE`n$output" }
         return $output
@@ -351,19 +383,22 @@ try {
         $MinHookHookObject = Join-Path $ObjDir "hook.obj"
         $MinHookTrampolineObject = Join-Path $ObjDir "trampoline.obj"
         $MinHookHdeObject = Join-Path $ObjDir "hde64.obj"
+        $BridgeObject = Join-Path $ObjDir "bridge.obj"
         Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
-            "/nologo", "/std:c++17", "/EHsc", "/O2", "/LD", $BridgeSource,
+            "/nologo", "/std:c++17", "/EHsc", "/O2", "/c", $BridgeSource,
             "/I$MinHookIncludeDir",
-            "/Fo:$(Join-Path $ObjDir 'bridge.obj')",
-            "/Fe:$BridgeOutput",
+            "/Fo:$BridgeObject"
+        )
+        Invoke-VsToolCommand -ToolName "link.exe" -ToolArgs @(
+            "/nologo", "/DLL", "/Brepro",
+            "/OUT:$BridgeOutput",
+            $BridgeObject,
             $MinHookBufferObject,
             $MinHookHookObject,
             $MinHookTrampolineObject,
             $MinHookHdeObject,
             "Ws2_32.lib",
-            "User32.lib",
-            "/link",
-            "/Brepro"
+            "User32.lib"
         )
     }
     Invoke-BuildStep -Name "compile native injector" -ScriptBlock {
