@@ -5867,8 +5867,8 @@ static void NativeReplaySamplesUvTextureDirectly()
         "replay must read the current albedo texture");
     Assert(body.Contains("sdk::EPaintChannel::Metallic", StringComparison.Ordinal),
         "replay must read the packed PBR texture");
-    Assert(body.Contains("albedo.bytes[offset + 3U] == 0U", StringComparison.Ordinal),
-        "replay must skip fully transparent texels");
+    Assert(!body.Contains("albedo.bytes[offset + 3U] == 0U", StringComparison.Ordinal),
+        "replay must not drop texels based on the paint texture alpha");
     Assert(body.Contains("albedo.bytes[offset]", StringComparison.Ordinal) &&
            body.Contains("packed_pbr.bytes[offset]", StringComparison.Ordinal),
         "replay must sample albedo and packed PBR at the same direct texture index");

@@ -24260,11 +24260,6 @@ namespace
                          static_cast<std::size_t>(texture_size) +
                      static_cast<std::size_t>(x)) *
                     4U;
-                if (albedo.bytes[offset + 3U] == 0U)
-                {
-                    ++transparent_skipped;
-                    continue;
-                }
                 const double u =
                     static_cast<double>(x) / texture_size_denominator;
                 const double r =
