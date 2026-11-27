@@ -1047,6 +1047,8 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
+            session.Log.Error($"Command {command?.Command ?? "?"} failed: {ex.Message}");
+            DiagnosticsState.RecordException("web_command_failed", ex);
             PostResponse(command?.Id ?? "", false, new { message = ex.Message });
         }
     }

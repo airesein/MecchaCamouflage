@@ -249,6 +249,31 @@ public sealed class HostSession
 
     public async Task<PaintTextureExportResult> ExportCurrentPaintTextureAsync(CancellationToken cancellationToken = default)
     {
+        lock (paintStateGate)
+        {
+            if (PaintRunning || nativePaintMayBeRunning)
+            {
+                const string message = "Stop the active paint before exporting the current paint.";
+                Log.Warn("Paint export failed: " + message);
+                return new PaintTextureExportResult(false, message, "", "", "", "", 0);
+            }
+        }
+        try
+        {
+            var result = await ExportCurrentPaintTextureCoreAsync(cancellationToken);
+            if (!result.Success)
+                Log.Warn("Paint export failed: " + (string.IsNullOrWhiteSpace(result.Message) ? "unknown" : result.Message));
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Paint export failed: " + ex.Message);
+            return new PaintTextureExportResult(false, ex.Message, "", "", "", "", 0);
+        }
+    }
+
+    private async Task<PaintTextureExportResult> ExportCurrentPaintTextureCoreAsync(CancellationToken cancellationToken)
+    {
         using var process = Runtime.FindGameProcess(Settings.GameProcessName);
         if (process is null)
             return new PaintTextureExportResult(false, "Game process not found.", "", "", "", "", 0);
@@ -376,6 +401,31 @@ public sealed class HostSession
     }
 
     public async Task<PaintTextureImportResult> ImportPaintTextureAsync(string manifestPath, CancellationToken cancellationToken = default)
+    {
+        lock (paintStateGate)
+        {
+            if (PaintRunning || nativePaintMayBeRunning)
+            {
+                const string message = "Stop the active paint before reusing a paint export.";
+                Log.Warn("Paint import failed: " + message);
+                return new PaintTextureImportResult(false, message, "paint_running");
+            }
+        }
+        try
+        {
+            var result = await ImportPaintTextureCoreAsync(manifestPath, cancellationToken);
+            if (!result.Success)
+                Log.Warn("Paint import failed: " + (string.IsNullOrWhiteSpace(result.Message) ? "unknown" : result.Message));
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Paint import failed: " + ex.Message);
+            return new PaintTextureImportResult(false, ex.Message, "exception");
+        }
+    }
+
+    private async Task<PaintTextureImportResult> ImportPaintTextureCoreAsync(string manifestPath, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath))
             return new PaintTextureImportResult(false, "The selected paint export does not exist.", "manifest_missing");
