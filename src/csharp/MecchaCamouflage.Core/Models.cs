@@ -153,13 +153,16 @@ public sealed class ImagePaintSettings
     public const int BackgroundPbrCanvasEncodingVersion = 2;
 
     public static bool IsSupportedBodyType(string? bodyType) =>
-        bodyType is "round" or "cube" or "fukuyoka";
+        bodyType is "round" or "cube" or "fukuyoka" or "mecho" or "octopus" or "porigon";
 
     public static string NormalizeBodyType(string? bodyType) =>
         bodyType?.Trim().ToLowerInvariant() switch
         {
             "cube" => "cube",
             "fukuyoka" => "fukuyoka",
+            "mecho" => "mecho",
+            "octopus" => "octopus",
+            "porigon" => "porigon",
             _ => "round"
         };
 
@@ -219,7 +222,7 @@ public sealed class ImagePaintSettings
         }
         if (!IsSupportedBodyType(BodyType))
         {
-            message = "Image body type must be round, cube, or fukuyoka.";
+            message = "Image body type must be round, cube, fukuyoka, mecho, octopus, or porigon.";
             return false;
         }
         if (AlphaMode is not ("skip" or "background"))

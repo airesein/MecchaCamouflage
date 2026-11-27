@@ -55,8 +55,12 @@ const IMAGE_RESIZE_HANDLE_SIZE = 20;
 const IMAGE_GUIDE_PROFILE_FILES = Object.freeze({
   round: "mesh-profiles/paintman.image-profile-v2.json",
   cube: "mesh-profiles/paintman_cube.image-profile-v2.json",
-  fukuyoka: "mesh-profiles/paintman_hukuyoka.image-profile-v2.json"
+  fukuyoka: "mesh-profiles/paintman_hukuyoka.image-profile-v2.json",
+  mecho: "mesh-profiles/paintman_mecho.image-profile-v2.json",
+  octopus: "mesh-profiles/paintman_octopus.image-profile-v2.json",
+  porigon: "mesh-profiles/paintman_porigon.image-profile-v2.json"
 });
+const imageGuideProfileAvailability = { mecho: false, octopus: false, porigon: false };
 const imageGuideCanvasCache = new Map();
 const imageGuideProfileLoads = new Map();
 let imageGuideCanvasLocale = "";
@@ -1262,6 +1266,10 @@ function initializeImageEditor() {
   byId("image-guide-round").addEventListener("click", () => setImageBodyType("round"));
   byId("image-guide-cube").addEventListener("click", () => setImageBodyType("cube"));
   byId("image-guide-fukuyoka").addEventListener("click", () => setImageBodyType("fukuyoka"));
+  for (const bodyType of ["mecho", "octopus", "porigon"]) {
+    byId(`image-guide-${bodyType}`).addEventListener("click", () => setImageBodyType(bodyType));
+  }
+  refreshBodyTypeAvailability().catch(() => {});
   byId("image-upload").addEventListener("click", () => {
     if (canEditImage()) input.click();
   });
@@ -1617,7 +1625,29 @@ function drawImageComposition() {
 }
 
 function normalizeImageGuideBodyType(bodyType) {
-  return bodyType === "cube" || bodyType === "fukuyoka" ? bodyType : "round";
+  return ["round", "cube", "fukuyoka", "mecho", "octopus", "porigon"].includes(bodyType) ? bodyType : "round";
+}
+
+async function refreshBodyTypeAvailability() {
+  for (const bodyType of ["mecho", "octopus", "porigon"]) {
+    const button = byId(`image-guide-${bodyType}`);
+    if (!button) continue;
+    let available = false;
+    try {
+      const response = await fetch(IMAGE_GUIDE_PROFILE_FILES[bodyType], { cache: "no-store" });
+      if (response.ok) {
+        await response.json();
+        available = true;
+      }
+    } catch {
+      available = false;
+    }
+    imageGuideProfileAvailability[bodyType] = available;
+    button.dataset.profileAvailable = available ? "1" : "0";
+    button.title = available ? "" : i18n("image.body.type.missing");
+    if (!available) button.disabled = true;
+  }
+  if (imageEditor) renderImageEditor();
 }
 
 function loadReferenceImageGuideProfile(bodyType) {
@@ -2193,7 +2223,10 @@ function renderImageEditor() {
   for (const [id, active] of [
     ["image-guide-round", imageEditor.bodyType === "round"],
     ["image-guide-cube", imageEditor.bodyType === "cube"],
-    ["image-guide-fukuyoka", imageEditor.bodyType === "fukuyoka"]
+    ["image-guide-fukuyoka", imageEditor.bodyType === "fukuyoka"],
+    ["image-guide-mecho", imageEditor.bodyType === "mecho"],
+    ["image-guide-octopus", imageEditor.bodyType === "octopus"],
+    ["image-guide-porigon", imageEditor.bodyType === "porigon"]
   ]) {
     byId(id).classList.toggle("active", active);
   }
@@ -2206,6 +2239,11 @@ function renderImageEditor() {
   for (const control of document.querySelectorAll(".image-edit-control")) {
     if (control.classList.contains("image-transfer-control")) continue;
     control.disabled = !editable;
+  }
+  for (const [bodyType, available] of Object.entries(imageGuideProfileAvailability)) {
+    if (available) continue;
+    const button = byId(`image-guide-${bodyType}`);
+    if (button) button.disabled = true;
   }
   renderImageRegionButtons(imageEditor, editable);
   renderImageFill(imageEditor, editable);

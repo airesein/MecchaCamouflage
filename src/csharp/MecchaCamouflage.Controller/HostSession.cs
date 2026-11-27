@@ -260,10 +260,39 @@ public sealed class HostSession
         }
         try
         {
-            var result = await ExportCurrentPaintTextureCoreAsync(cancellationToken);
-            if (!result.Success)
-                Log.Warn("Paint export failed: " + (string.IsNullOrWhiteSpace(result.Message) ? "unknown" : result.Message));
-            return result;
+            var staging = Path.Combine(Path.GetTempPath(), "MecchaCamouflage", "paint-export-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(staging);
+            try
+            {
+                var result = await ExportCurrentPaintTextureCoreAsync(staging, cancellationToken);
+                if (!result.Success)
+                {
+                    Log.Warn("Paint export failed: " + (string.IsNullOrWhiteSpace(result.Message) ? "unknown" : result.Message));
+                    return result;
+                }
+                using var document = JsonDocument.Parse(File.ReadAllText(result.ManifestPath));
+                var root = document.RootElement;
+                var albedoRgba = Path.Combine(staging, root.GetProperty("albedo_rgba").GetString()!);
+                var pbrRgba = Path.Combine(staging, root.GetProperty("pbr_rgba").GetString()!);
+                var directory = Paths.PaintExportsDirectory;
+                Directory.CreateDirectory(directory);
+                var mcpaint = Path.Combine(
+                    directory,
+                    "paint-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + PaintTextureArchive.Extension);
+                PaintTextureArchive.Write(mcpaint, result.ManifestPath, albedoRgba, pbrRgba, result.AlbedoPng, result.PbrPng);
+                Log.Info($"Paint texture exported | size={result.TextureSize} | file={mcpaint}");
+                return new PaintTextureExportResult(true, "", directory, mcpaint, "", "", result.TextureSize);
+            }
+            finally
+            {
+                try
+                {
+                    Directory.Delete(staging, true);
+                }
+                catch
+                {
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -272,7 +301,7 @@ public sealed class HostSession
         }
     }
 
-    private async Task<PaintTextureExportResult> ExportCurrentPaintTextureCoreAsync(CancellationToken cancellationToken)
+    private async Task<PaintTextureExportResult> ExportCurrentPaintTextureCoreAsync(string outputDirectory, CancellationToken cancellationToken)
     {
         using var process = Runtime.FindGameProcess(Settings.GameProcessName);
         if (process is null)
@@ -335,7 +364,7 @@ public sealed class HostSession
                 false, "The exported texture size does not match its reported dimensions.", "", "", "", "", 0);
         }
 
-        var directory = Paths.PaintExportsDirectory;
+        var directory = outputDirectory;
         Directory.CreateDirectory(directory);
         var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff");
         var albedoRgbaPath = Path.Combine(directory, $"paint-{stamp}-albedo.rgba");
@@ -382,10 +411,32 @@ public sealed class HostSession
         }
         try
         {
-            var result = await ImportPaintTextureCoreAsync(manifestPath, cancellationToken);
-            if (!result.Success)
-                Log.Warn("Paint import failed: " + (string.IsNullOrWhiteSpace(result.Message) ? "unknown" : result.Message));
-            return result;
+            if (string.Equals(Path.GetExtension(manifestPath), PaintTextureArchive.Extension, StringComparison.OrdinalIgnoreCase))
+            {
+                var staging = Path.Combine(Path.GetTempPath(), "MecchaCamouflage", "paint-import-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    PaintTextureArchive.Extract(manifestPath, staging);
+                    var result = await ImportPaintTextureCoreAsync(Path.Combine(staging, "manifest.json"), cancellationToken);
+                    if (!result.Success)
+                        Log.Warn("Paint import failed: " + (string.IsNullOrWhiteSpace(result.Message) ? "unknown" : result.Message));
+                    return result;
+                }
+                finally
+                {
+                    try
+                    {
+                        Directory.Delete(staging, true);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            var legacy = await ImportPaintTextureCoreAsync(manifestPath, cancellationToken);
+            if (!legacy.Success)
+                Log.Warn("Paint import failed: " + (string.IsNullOrWhiteSpace(legacy.Message) ? "unknown" : legacy.Message));
+            return legacy;
         }
         catch (Exception ex)
         {
@@ -461,9 +512,15 @@ public sealed class HostSession
         object? latest = null;
         if (Directory.Exists(directory))
         {
-            var manifest = Directory.EnumerateFiles(directory, "paint-*.json")
+            var manifest = Directory.EnumerateFiles(directory, "*" + PaintTextureArchive.Extension)
                 .OrderByDescending(File.GetLastWriteTimeUtc)
                 .FirstOrDefault();
+            if (manifest is null)
+            {
+                manifest = Directory.EnumerateFiles(directory, "paint-*.json")
+                    .OrderByDescending(File.GetLastWriteTimeUtc)
+                    .FirstOrDefault();
+            }
             if (manifest is not null)
                 latest = new { manifestPath = manifest, directory };
         }

@@ -7936,6 +7936,18 @@ namespace
     {
         const auto identity = lower_copy(
             profile.profile_id + "\n" + profile.source_path + "\n" + profile.export_name);
+        if (identity.find("mecho") != std::string::npos)
+        {
+            return "mecho";
+        }
+        if (identity.find("octopus") != std::string::npos)
+        {
+            return "octopus";
+        }
+        if (identity.find("porigon") != std::string::npos)
+        {
+            return "porigon";
+        }
         if (identity.find("fukuyoka") != std::string::npos ||
             identity.find("hukuyoka") != std::string::npos)
         {
@@ -15984,13 +15996,18 @@ namespace
     {
         const std::string requested_body = lower_copy(json_string_field(request, "image_paint_body_type", "round"));
         const bool capture_image_reference_pose = json_bool_field(request, "capture_reference_pose", false);
-        if (requested_body != "round" && requested_body != "cube" && requested_body != "fukuyoka")
+        if (requested_body != "round" &&
+            requested_body != "cube" &&
+            requested_body != "fukuyoka" &&
+            requested_body != "mecho" &&
+            requested_body != "octopus" &&
+            requested_body != "porigon")
         {
             return response_json(false,
                                  "image_guide_body_type_invalid",
                                  0,
                                  1,
-                                 "Image guide body type must be round, cube, or fukuyoka.");
+                                 "Image guide body type must be round, cube, fukuyoka, mecho, octopus, or porigon.");
         }
 
         Reflection ref{};
@@ -17136,7 +17153,10 @@ namespace
             const bool image_body_valid =
                 image_paint_body_type == "round" ||
                 image_paint_body_type == "cube" ||
-                image_paint_body_type == "fukuyoka";
+                image_paint_body_type == "fukuyoka" ||
+                image_paint_body_type == "mecho" ||
+                image_paint_body_type == "octopus" ||
+                image_paint_body_type == "porigon";
             const bool image_decoded = base64_to_bytes(
                 image_paint_rgba_base64, image_paint_rgba, image_decode_failure);
             const std::size_t expected_image_paint_bytes =

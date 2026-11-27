@@ -122,6 +122,12 @@ internal static class Program
             return "fukuyoka";
         if (args.Any(argument => string.Equals(argument, "--capture-cube-reference-pose", StringComparison.Ordinal)))
             return "cube";
+        if (args.Any(argument => string.Equals(argument, "--capture-mecho-reference-pose", StringComparison.Ordinal)))
+            return "mecho";
+        if (args.Any(argument => string.Equals(argument, "--capture-octopus-reference-pose", StringComparison.Ordinal)))
+            return "octopus";
+        if (args.Any(argument => string.Equals(argument, "--capture-porigon-reference-pose", StringComparison.Ordinal)))
+            return "porigon";
         if (args.Any(argument => string.Equals(argument, "--capture-round-reference-pose", StringComparison.Ordinal)))
             return "round";
         return null;

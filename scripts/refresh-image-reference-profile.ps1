@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("round", "cube", "fukuyoka")]
+    [ValidateSet("round", "cube", "fukuyoka", "mecho", "octopus", "porigon")]
     [string]$BodyType = "round",
     [string]$PaksPath = "",
     [string]$MappingsPath = "",
@@ -11,6 +11,7 @@ param(
     [switch]$CaptureNeutralPose,
     [switch]$SkipMeshDump,
     [switch]$SkipBuild,
+    [string]$CaptureExecutable = "",
     [string]$BuildOutputDir = ".build\bin"
 )
 
@@ -99,6 +100,39 @@ $configuration = switch ($BodyType) {
             ExpectedBones = 28
         }
     }
+    "mecho" {
+        [PSCustomObject]@{
+            AssetPath = "Chameleon/Content/3Dmodel/cLeon/charactor/paintman/skeltal/mecho.uasset"
+            ExportName = "mecho"
+            RawProfileFile = "paintman_mecho.mesh-profile-v2.json"
+            ImageProfileFile = "paintman_mecho.image-profile-v2.json"
+            ExpectedVertices = 1660
+            ExpectedIndices = 8352
+            ExpectedBones = 28
+        }
+    }
+    "octopus" {
+        [PSCustomObject]@{
+            AssetPath = "Chameleon/Content/3Dmodel/cLeon/charactor/paintman/skeltal/Octopus_fix.uasset"
+            ExportName = "Octopus_fix"
+            RawProfileFile = "paintman_octopus.mesh-profile-v2.json"
+            ImageProfileFile = "paintman_octopus.image-profile-v2.json"
+            ExpectedVertices = 1302
+            ExpectedIndices = 6480
+            ExpectedBones = 28
+        }
+    }
+    "porigon" {
+        [PSCustomObject]@{
+            AssetPath = "Chameleon/Content/3Dmodel/cLeon/charactor/paintman/skeltal/porigon.uasset"
+            ExportName = "porigon"
+            RawProfileFile = "paintman_porigon.mesh-profile-v2.json"
+            ImageProfileFile = "paintman_porigon.image-profile-v2.json"
+            ExpectedVertices = 1632
+            ExpectedIndices = 1638
+            ExpectedBones = 28
+        }
+    }
     default {
         [PSCustomObject]@{
             AssetPath = "Chameleon/Content/3Dmodel/cLeon/charactor/paintman/skeltal/paintman.uasset"
@@ -143,15 +177,19 @@ try {
     if (-not (Test-Path -LiteralPath $rawProfilePath)) {
         throw "Raw mesh profile is missing after generation: $rawProfilePath"
     }
-    if (-not $SkipBuild) {
+    if ([string]::IsNullOrWhiteSpace($CaptureExecutable) -and -not $SkipBuild) {
         Invoke-Step -Name "build capture host" -ScriptBlock {
             & (Join-Path $repoRoot "scripts\build.ps1") -RuntimeRoot $repoRoot -OutDir $BuildOutputDir
         }
     }
 
-    $captureExecutable = Join-Path $repoRoot (Join-Path $BuildOutputDir "meccha-camouflage.exe")
+    $captureExecutable = if (-not [string]::IsNullOrWhiteSpace($CaptureExecutable)) {
+        $CaptureExecutable
+    } else {
+        Join-Path $repoRoot (Join-Path $BuildOutputDir "meccha-camouflage.exe")
+    }
     if (-not (Test-Path -LiteralPath $captureExecutable)) {
-        throw "Capture executable is missing: $captureExecutable. Build it or omit -SkipBuild."
+        throw "Capture executable is missing: $captureExecutable. Build it, pass -CaptureExecutable, or omit -SkipBuild."
     }
     $snapshot = Read-CaptureSnapshot $captureExecutable "--capture-$BodyType-reference-pose"
     if (-not $snapshot.Success) {
