@@ -3759,7 +3759,7 @@ static void ProfileRefreshSupportsFukuyoka()
         repository, "resources", "mesh-profiles", "paintman_hukuyoka.image-profile-v2.json")));
     var imageRoot = imageProfile.RootElement;
 
-    Assert(refresh.Contains("[ValidateSet(\"round\", \"cube\", \"fukuyoka\")]", StringComparison.Ordinal) &&
+    Assert(refresh.Contains("[ValidateSet(\"round\", \"cube\", \"fukuyoka\", \"mecho\", \"octopus\", \"porigon\")]", StringComparison.Ordinal) &&
            refresh.Contains("paintman_hukuyoka.uasset", StringComparison.Ordinal) &&
            refresh.Contains("paintman_hukuyoka.mesh-profile-v2.json", StringComparison.Ordinal) &&
            refresh.Contains("paintman_hukuyoka.image-profile-v2.json", StringComparison.Ordinal) &&
