@@ -6,6 +6,7 @@ on:
       - main
       - master
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -56,3 +57,10 @@ jobs:
             -ExpectedVersion $env:BUILD_VERSION `
             -BridgePath ".build/obj/$env:BUILD_VERSION/package-native/runtime-bridge.dll" `
             -ProfileDirectory "resources/mesh-profiles"
+
+      - name: Upload packaged executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: meccacamouflage
+          path: .build/package/meccha-camouflage-*.exe
+          if-no-files-found: error

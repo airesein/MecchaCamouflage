@@ -1854,9 +1854,15 @@ namespace
 
         auto init(std::string& failure) -> bool
         {
-            static const std::vector<std::uint8_t> gu_sig{0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0x01, 0x45, 0x8B, 0xD1};
-            static const std::vector<std::uint8_t> gu_mask{1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1};
-            const auto gu_ref = scan_pattern(gu_sig, gu_mask);
+            static const std::vector<std::uint8_t> gu_sig{0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x4C, 0x8B, 0xC9, 0x48, 0x89, 0x01, 0xB8, 0xFF, 0xFF};
+            static const std::vector<std::uint8_t> gu_mask{1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+            static const std::vector<std::uint8_t> legacy_gu_sig{0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0x01, 0x45, 0x8B, 0xD1};
+            static const std::vector<std::uint8_t> legacy_gu_mask{1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1};
+            auto gu_ref = scan_pattern(gu_sig, gu_mask);
+            if (!gu_ref)
+            {
+                gu_ref = scan_pattern(legacy_gu_sig, legacy_gu_mask);
+            }
             if (!gu_ref)
             {
                 failure = "guobject_pattern_not_found";
@@ -1864,13 +1870,34 @@ namespace
             }
             const auto rel = safe_read<std::int32_t>(gu_ref + 3);
             guobject_array = gu_ref + 7 + rel;
-            const auto delta_candidate = guobject_array - 0xE3B40;
-            names.pool = delta_candidate;
-            names.detect();
-            if (names.resolve(0) == "None")
+
+            static const std::vector<std::uint8_t> gnames_sig{0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xE9, 0x89, 0x00, 0x00, 0x00};
+            static const std::vector<std::uint8_t> gnames_mask{1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1};
+            const auto gnames_ref = scan_pattern(gnames_sig, gnames_mask);
+            if (gnames_ref)
             {
-                fname_pool = delta_candidate;
-                return true;
+                names.pool = gnames_ref + 7 + safe_read<std::int32_t>(gnames_ref + 3);
+                names.detect();
+                if (names.resolve(0) == "None")
+                {
+                    fname_pool = names.pool;
+                    return true;
+                }
+            }
+
+            const std::intptr_t fname_deltas[]{
+                static_cast<std::intptr_t>(0x2AC6A0),
+                -static_cast<std::intptr_t>(0xE3B40),
+            };
+            for (const auto delta : fname_deltas)
+            {
+                names.pool = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(guobject_array) + delta);
+                names.detect();
+                if (names.resolve(0) == "None")
+                {
+                    fname_pool = names.pool;
+                    return true;
+                }
             }
 
             const std::vector<std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> patterns{
