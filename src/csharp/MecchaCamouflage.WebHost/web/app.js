@@ -1267,6 +1267,9 @@ function initializeImageEditor() {
   });
   byId("image-preset-load").addEventListener("click", () => loadImagePreset().catch(error => showError(error.message || String(error))));
   byId("image-preset-save").addEventListener("click", () => saveImagePreset().catch(error => showError(error.message || String(error))));
+  byId("image-export-paint").addEventListener("click", () => exportCurrentPaint().catch(error => showError(error.message || String(error))));
+  byId("image-reuse-paint").addEventListener("click", () => reuseCurrentPaint().catch(error => showError(error.message || String(error))));
+  refreshPaintExports().catch(() => {});
   input.addEventListener("change", event => {
     const files = Array.from(event.target.files || []);
     event.target.value = "";
@@ -2200,7 +2203,10 @@ function renderImageEditor() {
   setNumberPair("image-roughness", "image-roughness-number", imageEditor.roughness);
   setNumberPair("image-emissive", "image-emissive-number", imageEditor.emissive);
   const editable = canEditDraft() && !imageEditor.restoring;
-  for (const control of document.querySelectorAll(".image-edit-control")) control.disabled = !editable;
+  for (const control of document.querySelectorAll(".image-edit-control")) {
+    if (control.classList.contains("image-transfer-control")) continue;
+    control.disabled = !editable;
+  }
   renderImageRegionButtons(imageEditor, editable);
   renderImageFill(imageEditor, editable);
   byId("image-drop-zone").classList.toggle("readonly", !editable);
@@ -2347,6 +2353,32 @@ async function saveImagePreset() {
   const result = await send("saveImagePreset", staged);
   if (!result?.success) throw new Error(result?.message || "The preset could not be saved.");
   if (!result.cancelled) toast(i18n("toast.image.preset.saved"));
+}
+
+let lastPaintExportManifest = "";
+
+async function exportCurrentPaint() {
+  const result = await send("exportCurrentPaint", {}, 180000);
+  if (!result?.success) throw new Error(result?.message || "The current paint could not be exported.");
+  lastPaintExportManifest = result.manifestPath || "";
+  setValue("image-export-path", result.manifestPath || result.directory || "");
+  byId("image-reuse-paint").disabled = !lastPaintExportManifest;
+  toast(i18n("toast.image.export.saved"));
+}
+
+async function reuseCurrentPaint() {
+  if (!lastPaintExportManifest) throw new Error(i18n("error.image.export.none"));
+  const result = await send("importCurrentPaint", { manifestPath: lastPaintExportManifest }, 180000);
+  if (!result?.success) throw new Error(result?.message || "The saved paint could not be reused.");
+  toast(i18n("toast.image.export.reused"));
+}
+
+async function refreshPaintExports() {
+  const result = await send("listPaintExports");
+  if (!result?.success || !result.latest) return;
+  lastPaintExportManifest = result.latest.manifestPath || "";
+  setValue("image-export-path", result.latest.manifestPath || result.latest.directory || "");
+  byId("image-reuse-paint").disabled = !lastPaintExportManifest;
 }
 
 async function stageImageDesignAsset(transferId, asset, data) {

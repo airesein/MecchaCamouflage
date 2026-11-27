@@ -1155,6 +1155,12 @@ public sealed class MainForm : Form
                 return HandleLoadImagePreset();
             case "saveImagePreset":
                 return HandleSaveImagePreset(command.Payload);
+            case "exportCurrentPaint":
+                return await HandleExportCurrentPaintAsync();
+            case "importCurrentPaint":
+                return await HandleImportCurrentPaintAsync(command.Payload);
+            case "listPaintExports":
+                return session.GetLatestPaintExport();
             case "paint":
             case "stop":
             case "preview":
@@ -1244,6 +1250,32 @@ public sealed class MainForm : Form
             return new { success = true, cancelled = true };
         var result = session.SaveImagePreset(dialog.FileName, design);
         return new { success = result.Success, message = result.Message, path = result.Success ? result.Message : "" };
+    }
+
+    private async Task<object> HandleExportCurrentPaintAsync()
+    {
+        var result = await session.ExportCurrentPaintTextureAsync();
+        return new
+        {
+            success = result.Success,
+            message = result.Message,
+            directory = result.Directory,
+            manifestPath = result.ManifestPath,
+            albedoPng = result.AlbedoPng,
+            pbrPng = result.PbrPng,
+            textureSize = result.TextureSize
+        };
+    }
+
+    private async Task<object> HandleImportCurrentPaintAsync(JsonElement payload)
+    {
+        var manifestPath = payload.TryGetProperty("manifestPath", out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? ""
+            : "";
+        if (string.IsNullOrWhiteSpace(manifestPath))
+            return new { success = false, message = "Export the current paint first." };
+        var result = await session.ImportPaintTextureAsync(manifestPath);
+        return new { success = result.Success, message = result.Message, stage = result.Stage };
     }
 
     private bool TryReadImageDesign(JsonElement payload, out ImagePaintSettings design, out string message)

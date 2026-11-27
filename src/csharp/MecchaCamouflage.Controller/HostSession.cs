@@ -247,6 +247,210 @@ public sealed class HostSession
     public bool TryLoadImagePreset(string path, out ImagePaintSettings design, out string message) =>
         ImagePresets.TryLoadPreset(path, out design, out message);
 
+    public async Task<PaintTextureExportResult> ExportCurrentPaintTextureAsync(CancellationToken cancellationToken = default)
+    {
+        using var process = Runtime.FindGameProcess(Settings.GameProcessName);
+        if (process is null)
+            return new PaintTextureExportResult(false, "Game process not found.", "", "", "", "", 0);
+        if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
+            return new PaintTextureExportResult(false, "Bridge is not connected.", "", "", "", "", 0);
+        const string payload =
+            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"resolved\",\"research_compact\":true}";
+        var reply = await Runtime.SendPaintCommandAsync(payload, TimeSpan.FromSeconds(120), cancellationToken);
+        if (!reply.Ok || !reply.Success)
+        {
+            return new PaintTextureExportResult(
+                false,
+                string.IsNullOrWhiteSpace(reply.Message) ? "The game did not return a paint texture." : reply.Message,
+                "", "", "", "", 0);
+        }
+
+        string albedoDump = "";
+        string pbrDump = "";
+        var size = 0;
+        try
+        {
+            using var document = JsonDocument.Parse(reply.Raw);
+            if (!document.RootElement.TryGetProperty("metadata", out var metadata) ||
+                metadata.ValueKind != JsonValueKind.Object)
+            {
+                return new PaintTextureExportResult(false, "The paint texture reply did not contain metadata.", "", "", "", "", 0);
+            }
+            if (metadata.TryGetProperty("runtime_paint_component_inventory", out var inventory) &&
+                inventory.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in inventory.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Object)
+                        continue;
+                    var written = item.TryGetProperty("albedo_dump_written", out var writtenElement) &&
+                                  writtenElement.ValueKind == JsonValueKind.True;
+                    if (!written)
+                        continue;
+                    var candidate = Text(item, "albedo_dump_path", "");
+                    if (string.IsNullOrWhiteSpace(candidate))
+                        continue;
+                    var matches = item.TryGetProperty("matches_resolved_component", out var matchElement) &&
+                                  matchElement.ValueKind == JsonValueKind.True;
+                    if (matches || string.IsNullOrWhiteSpace(albedoDump))
+                    {
+                        albedoDump = candidate;
+                        size = Int(item, "albedo_dump_texture_size", size);
+                        var candidatePbr = Text(item, "packed_pbr_dump_path", "");
+                        if (!string.IsNullOrWhiteSpace(candidatePbr))
+                            pbrDump = candidatePbr;
+                    }
+                    if (matches)
+                        break;
+                }
+            }
+        }
+        catch (JsonException ex)
+        {
+            return new PaintTextureExportResult(false, "The paint texture reply was not valid JSON: " + ex.Message, "", "", "", "", 0);
+        }
+
+        if (string.IsNullOrWhiteSpace(albedoDump) || size <= 0)
+            return new PaintTextureExportResult(false, "The game did not return a readable paint texture dump.", "", "", "", "", 0);
+        if (string.IsNullOrWhiteSpace(pbrDump))
+        {
+            var albedoName = Path.GetFileName(albedoDump);
+            var pbrName = albedoName.Replace(
+                "research-texture-albedo-",
+                "research-texture-packed-pbr-",
+                StringComparison.OrdinalIgnoreCase);
+            if (!string.Equals(albedoName, pbrName, StringComparison.OrdinalIgnoreCase))
+                pbrDump = Path.Combine(Path.GetDirectoryName(albedoDump) ?? "", pbrName);
+        }
+
+        byte[] albedoBytes;
+        byte[] pbrBytes;
+        try
+        {
+            albedoBytes = File.ReadAllBytes(albedoDump);
+            pbrBytes = File.ReadAllBytes(pbrDump);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new PaintTextureExportResult(false, "Could not read the exported texture: " + ex.Message, "", "", "", "", 0);
+        }
+        var expected = (long)size * size * 4L;
+        if (albedoBytes.LongLength != expected || pbrBytes.LongLength != expected)
+        {
+            return new PaintTextureExportResult(
+                false, "The exported texture size does not match its reported dimensions.", "", "", "", "", 0);
+        }
+
+        var directory = Paths.PaintExportsDirectory;
+        Directory.CreateDirectory(directory);
+        var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff");
+        var albedoRgbaPath = Path.Combine(directory, $"paint-{stamp}-albedo.rgba");
+        var pbrRgbaPath = Path.Combine(directory, $"paint-{stamp}-pbr.rgba");
+        var albedoPngPath = Path.Combine(directory, $"paint-{stamp}-albedo.png");
+        var pbrPngPath = Path.Combine(directory, $"paint-{stamp}-pbr.png");
+        var manifestPath = Path.Combine(directory, $"paint-{stamp}.json");
+        try
+        {
+            File.WriteAllBytes(albedoRgbaPath, albedoBytes);
+            File.WriteAllBytes(pbrRgbaPath, pbrBytes);
+            UvReplayAtlasPng.Write(albedoPngPath, new UvReplayAtlas(size, size, albedoBytes));
+            UvReplayAtlasPng.Write(pbrPngPath, new UvReplayAtlas(size, size, pbrBytes));
+            var manifest = JsonSerializer.Serialize(new
+            {
+                schema = "meccha_paint_texture_export_v1",
+                texture_size = size,
+                albedo_rgba = Path.GetFileName(albedoRgbaPath),
+                pbr_rgba = Path.GetFileName(pbrRgbaPath),
+                albedo_png = Path.GetFileName(albedoPngPath),
+                pbr_png = Path.GetFileName(pbrPngPath),
+                created_utc = DateTime.UtcNow
+            });
+            File.WriteAllText(manifestPath, manifest);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new PaintTextureExportResult(false, "Could not save the exported texture: " + ex.Message, "", "", "", "", 0);
+        }
+        Log.Info($"Paint texture exported | size={size} | manifest={manifestPath}");
+        return new PaintTextureExportResult(true, "", directory, manifestPath, albedoPngPath, pbrPngPath, size);
+    }
+
+    public async Task<PaintTextureImportResult> ImportPaintTextureAsync(string manifestPath, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath))
+            return new PaintTextureImportResult(false, "The selected paint export does not exist.", "manifest_missing");
+        string albedoPath;
+        string pbrPath;
+        int size;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
+            var root = document.RootElement;
+            if (!root.TryGetProperty("schema", out var schema) ||
+                schema.ValueKind != JsonValueKind.String ||
+                !string.Equals(schema.GetString(), "meccha_paint_texture_export_v1", StringComparison.Ordinal))
+            {
+                return new PaintTextureImportResult(false, "The selected file is not a supported paint export.", "manifest_schema");
+            }
+            if (!root.TryGetProperty("texture_size", out var sizeElement) ||
+                !sizeElement.TryGetInt32(out size) || size <= 0 ||
+                !root.TryGetProperty("albedo_rgba", out var albedoElement) ||
+                albedoElement.ValueKind != JsonValueKind.String ||
+                !root.TryGetProperty("pbr_rgba", out var pbrElement) ||
+                pbrElement.ValueKind != JsonValueKind.String)
+            {
+                return new PaintTextureImportResult(false, "The paint export manifest is invalid.", "manifest_fields");
+            }
+            var directory = Path.GetDirectoryName(Path.GetFullPath(manifestPath))!;
+            albedoPath = Path.Combine(directory, albedoElement.GetString()!);
+            pbrPath = Path.Combine(directory, pbrElement.GetString()!);
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            return new PaintTextureImportResult(false, "Could not read the paint export: " + ex.Message, "manifest_read");
+        }
+        if (!File.Exists(albedoPath) || !File.Exists(pbrPath))
+            return new PaintTextureImportResult(false, "The paint export texture files are missing.", "texture_missing");
+
+        using var process = Runtime.FindGameProcess(Settings.GameProcessName);
+        if (process is null)
+            return new PaintTextureImportResult(false, "Game process not found.", "process_missing");
+        if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
+            return new PaintTextureImportResult(false, "Bridge is not connected.", "bridge_missing");
+        var payload = JsonSerializer.Serialize(new
+        {
+            type = "import_paint_texture",
+            albedo_path = albedoPath,
+            pbr_path = pbrPath,
+            texture_size = size
+        });
+        var reply = await Runtime.SendPaintCommandAsync(payload, TimeSpan.FromSeconds(120), cancellationToken);
+        if (!reply.Ok || !reply.Success)
+        {
+            return new PaintTextureImportResult(
+                false,
+                string.IsNullOrWhiteSpace(reply.Message) ? "The game rejected the paint texture." : reply.Message,
+                reply.Stage);
+        }
+        Log.Info($"Paint texture imported locally | size={size} | manifest={manifestPath}");
+        return new PaintTextureImportResult(true, "", reply.Stage);
+    }
+
+    public object GetLatestPaintExport()
+    {
+        var directory = Paths.PaintExportsDirectory;
+        object? latest = null;
+        if (Directory.Exists(directory))
+        {
+            var manifest = Directory.EnumerateFiles(directory, "paint-*.json")
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault();
+            if (manifest is not null)
+                latest = new { manifestPath = manifest, directory };
+        }
+        return new { success = true, latest };
+    }
+
     public ImagePaintSettings GetImageDesignMetadata()
     {
         var design = GetImageDesign();

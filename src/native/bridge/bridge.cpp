@@ -947,6 +947,8 @@ namespace
     auto drain_paint_jobs_on_game_thread() -> void;
     auto is_paint_replication_probe_request(const std::string& request) -> bool;
     auto paint_replication_probe_on_game_thread(const std::string& request) -> std::string;
+    auto is_import_paint_texture_request(const std::string& request) -> bool;
+    auto import_paint_texture_on_game_thread(const std::string& request) -> std::string;
     auto auto_event_watch_record(std::uintptr_t object_address,
                                  std::uintptr_t function_address,
                                  std::uint8_t* params_bytes) -> void;
@@ -1375,6 +1377,36 @@ namespace
         if (!ok || read != text.size())
         {
             text.clear();
+            return false;
+        }
+        return true;
+    }
+
+    auto read_binary_file_w(const std::wstring& path, std::vector<std::uint8_t>& bytes) -> bool
+    {
+        bytes.clear();
+        if (path.empty())
+        {
+            return false;
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 128LL * 1024LL * 1024LL)
+        {
+            CloseHandle(file);
+            return false;
+        }
+        bytes.resize(static_cast<std::size_t>(size.QuadPart));
+        DWORD read = 0;
+        const auto ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
+        CloseHandle(file);
+        if (!ok || read != bytes.size())
+        {
+            bytes.clear();
             return false;
         }
         return true;
@@ -28692,6 +28724,139 @@ namespace
 
 
 
+    auto is_import_paint_texture_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"import_paint_texture\"") != std::string::npos;
+    }
+
+    auto import_paint_texture_on_game_thread(const std::string& request) -> std::string
+    {
+        Reflection ref{};
+        std::string failure{};
+        if (!ref.init(failure))
+        {
+            return response_json(false,
+                                 "sdk_update_required",
+                                 0,
+                                 1,
+                                 failure.empty() ? "SDK reflection init failed" : failure,
+                                 "\"route\":\"import_paint_texture\"");
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            return response_json(false,
+                                 ex.stage.c_str(),
+                                 0,
+                                 1,
+                                 ex.what(),
+                                 "\"route\":\"import_paint_texture\",\"sdk_resolution_exception\":true");
+        }
+        if (!ctx.ok)
+        {
+            return response_json(false,
+                                 ctx.stage.c_str(),
+                                 0,
+                                 1,
+                                 ctx.message,
+                                 "\"route\":\"import_paint_texture\"");
+        }
+        const auto albedo_path = json_string_field(request, "albedo_path", "");
+        const auto pbr_path = json_string_field(request, "pbr_path", "");
+        const int texture_size = json_int_field(request, "texture_size", 0, 0, 8192);
+        if (albedo_path.empty() || pbr_path.empty() || texture_size <= 0)
+        {
+            return response_json(false,
+                                 "import_paint_texture_paths_invalid",
+                                 0,
+                                 1,
+                                 "albedo_path, pbr_path and texture_size are required",
+                                 "\"route\":\"import_paint_texture\"");
+        }
+        const std::size_t expected_bytes =
+            static_cast<std::size_t>(texture_size) *
+            static_cast<std::size_t>(texture_size) * 4U;
+        std::vector<std::uint8_t> albedo{};
+        std::vector<std::uint8_t> packed_pbr{};
+        std::string metadata = "\"route\":\"import_paint_texture\"";
+        metadata += ",\"local_only\":true,\"replicated\":false";
+        metadata += ",\"texture_size\":" + std::to_string(texture_size);
+        metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
+        if (!read_binary_file_w(utf8_to_wstring(albedo_path), albedo))
+        {
+            return response_json(false,
+                                 "import_paint_texture_albedo_unreadable",
+                                 0,
+                                 1,
+                                 "could not read the exported albedo texture",
+                                 metadata);
+        }
+        if (!read_binary_file_w(utf8_to_wstring(pbr_path), packed_pbr))
+        {
+            return response_json(false,
+                                 "import_paint_texture_pbr_unreadable",
+                                 0,
+                                 1,
+                                 "could not read the exported packed PBR texture",
+                                 metadata);
+        }
+        if (albedo.size() != expected_bytes || packed_pbr.size() != expected_bytes)
+        {
+            return response_json(false,
+                                 "import_paint_texture_size_mismatch",
+                                 0,
+                                 1,
+                                 "exported texture size does not match texture_size",
+                                 metadata);
+        }
+        if (!mesh_first_import_channel_bytes(
+                ref,
+                ctx.component,
+                sdk::EPaintChannel::Albedo,
+                albedo,
+                failure))
+        {
+            return response_json(false,
+                                 "import_paint_texture_albedo_failed",
+                                 0,
+                                 1,
+                                 failure,
+                                 metadata);
+        }
+        if (!mesh_first_import_channel_bytes(
+                ref,
+                ctx.component,
+                sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive,
+                packed_pbr,
+                failure))
+        {
+            return response_json(false,
+                                 "import_paint_texture_pbr_failed",
+                                 0,
+                                 1,
+                                 failure,
+                                 metadata);
+        }
+        const auto verify_albedo =
+            mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+        const auto verify_metallic =
+            mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Metallic);
+        metadata += ",\"verify_albedo_ok\":" +
+                    std::string(json_bool(verify_albedo.ok && verify_albedo.bytes == albedo));
+        metadata += ",\"verify_pbr_ok\":" +
+                    std::string(json_bool(verify_metallic.ok && verify_metallic.bytes == packed_pbr));
+        return response_json(true,
+                             "import_paint_texture",
+                             0,
+                             0,
+                             "paint texture imported locally",
+                             metadata);
+    }
+
     auto drain_paint_jobs_on_game_thread() -> void
     {
         paint_dispatch_set_debug_stage(
@@ -28725,6 +28890,13 @@ namespace
             if (queued_paint_cancel_reason(job) != PaintCancelReason::None)
             {
                 complete_queued_paint_job(job, queued_paint_cancel_response(job));
+                continue;
+            }
+            if (is_import_paint_texture_request(job->request))
+            {
+                mark_queued_paint_job_dispatched(job);
+                const auto response = import_paint_texture_on_game_thread(job->request);
+                complete_queued_paint_job(job, response);
                 continue;
             }
             if (is_paint_replication_probe_request(job->request))
@@ -35917,6 +36089,10 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         if (line.find("\"type\":\"paint_replication_probe\"") != std::string::npos ||
             line.find("\"type\":\"paint_replication_pressure_probe\"") != std::string::npos ||
             line.find("\"type\":\"paint_replication_texture_probe\"") != std::string::npos)
+        {
+            return paint_full_route_native(line);
+        }
+        if (line.find("\"type\":\"import_paint_texture\"") != std::string::npos)
         {
             return paint_full_route_native(line);
         }

@@ -250,6 +250,12 @@ public sealed class RuntimeBridgeService
     public Task<BridgeReply> SendPaintAsync(string payload, CancellationToken cancellationToken = default) =>
         RequestActiveAsync(client => client.RequestAsync(payload, cancellationToken));
 
+    public Task<BridgeReply> SendPaintCommandAsync(
+        string payload,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default) =>
+        RequestActiveAsync(client => client.RequestAsync(payload, cancellationToken, timeout));
+
     /// <summary>
     /// Configures the in-process D3D12 Present compositor. The host supplies
     /// settings only; it never reads game memory or owns an overlay window.
