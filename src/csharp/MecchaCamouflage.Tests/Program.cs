@@ -5535,9 +5535,11 @@ static void RequiredSubmodulesAreDeclaredAndCheckedOut()
            modules.Contains("path = third_party/minhook", StringComparison.Ordinal) &&
            modules.Contains("https://github.com/TsudaKageyu/minhook.git", StringComparison.Ordinal),
         "the required MinHook gitlink must have a public submodule mapping");
-    Assert(ci.Contains("submodules: recursive", StringComparison.Ordinal) &&
-           release.Contains("submodules: recursive", StringComparison.Ordinal),
-        "CI and release builds must initialize required submodules");
+    var initializesRequiredSubmodule = (string workflow) =>
+        workflow.Contains("submodules: recursive", StringComparison.Ordinal) ||
+        workflow.Contains("git submodule update --init --recursive third_party/minhook", StringComparison.Ordinal);
+    Assert(initializesRequiredSubmodule(ci) && initializesRequiredSubmodule(release),
+        "CI and release builds must initialize the required MinHook submodule");
     Assert(readme.Contains("git clone --recurse-submodules", StringComparison.Ordinal) &&
            contributing.Contains("git clone --recurse-submodules", StringComparison.Ordinal) &&
            contributing.Contains("git submodule update --init --recursive", StringComparison.Ordinal),
