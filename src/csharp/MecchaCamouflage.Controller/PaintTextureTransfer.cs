@@ -1,4 +1,6 @@
 using System.IO.Compression;
+using System.Text;
+using System.Text.Json.Nodes;
 
 namespace MecchaCamouflage.Controller;
 
@@ -36,7 +38,7 @@ public static class PaintTextureArchive
             using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             using (var archive = new ZipArchive(stream, ZipArchiveMode.Create))
             {
-                Add(archive, "manifest.json", manifestPath);
+                AddText(archive, "manifest.json", NormalizeManifest(File.ReadAllText(manifestPath)));
                 Add(archive, "albedo.png", albedoPng);
                 Add(archive, "pbr.png", pbrPng);
                 Add(archive, "albedo.rgba", albedoRgba);
@@ -55,6 +57,20 @@ public static class PaintTextureArchive
     {
         Directory.CreateDirectory(targetDirectory);
         ZipFile.ExtractToDirectory(path, targetDirectory);
+        var manifestPath = Path.Combine(targetDirectory, "manifest.json");
+        if (File.Exists(manifestPath))
+            File.WriteAllText(manifestPath, NormalizeManifest(File.ReadAllText(manifestPath)));
+    }
+
+    private static string NormalizeManifest(string json)
+    {
+        var manifest = JsonNode.Parse(json) as JsonObject
+            ?? throw new InvalidDataException("The paint export manifest is not a JSON object.");
+        manifest["albedo_rgba"] = "albedo.rgba";
+        manifest["pbr_rgba"] = "pbr.rgba";
+        manifest["albedo_png"] = "albedo.png";
+        manifest["pbr_png"] = "pbr.png";
+        return manifest.ToJsonString();
     }
 
     private static void Add(ZipArchive archive, string name, string source)
@@ -63,5 +79,13 @@ public static class PaintTextureArchive
         using var input = File.OpenRead(source);
         using var output = entry.Open();
         input.CopyTo(output);
+    }
+
+    private static void AddText(ZipArchive archive, string name, string content)
+    {
+        var entry = archive.CreateEntry(name, CompressionLevel.Optimal);
+        using var output = entry.Open();
+        using var writer = new StreamWriter(output, new UTF8Encoding(false));
+        writer.Write(content);
     }
 }

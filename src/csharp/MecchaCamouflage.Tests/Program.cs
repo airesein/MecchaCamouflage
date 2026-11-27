@@ -1,4 +1,6 @@
+using System.IO.Compression;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -99,6 +101,7 @@ var tests = new List<(string Name, Action Run)>
     ("image layer crop validates normalized bounds", ImageLayerCropValidatesNormalizedBounds),
     ("legacy image transforms migrate to individual layers", LegacyImageTransformsMigrateToIndividualLayers),
     ("image preset round-trips an uncompressed container", ImagePresetRoundTripsUncompressedContainer),
+    ("paint texture archive normalizes manifest texture names", PaintTextureArchiveNormalizesManifest),
     ("v1 image preset expands global transforms to layers", V1ImagePresetExpandsGlobalTransformsToLayers),
     ("GUI image save persists the active preset state", GuiImageSavePersistsActivePresetState),
     ("legacy image config migrates to active image state", LegacyImageConfigMigratesToDiskLibrary),
@@ -3745,6 +3748,81 @@ static void HostAndCaptureToolPreserveFukuyoka()
            !mainForm.Contains("private static string NormalizeImageBodyType", StringComparison.Ordinal) &&
            !hostSession.Contains("private static string NormalizeImageBodyType", StringComparison.Ordinal),
         "guide requests, artifacts, and saved design manifests must share one body-type contract");
+}
+
+static void PaintTextureArchiveNormalizesManifest()
+{
+    var root = Path.Combine(Path.GetTempPath(), "meccha-paint-archive-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        Directory.CreateDirectory(root);
+        var source = Path.Combine(root, "source");
+        Directory.CreateDirectory(source);
+        var albedoPng = Path.Combine(source, "paint-1-albedo.png");
+        var pbrPng = Path.Combine(source, "paint-1-pbr.png");
+        var albedoRgba = Path.Combine(source, "paint-1-albedo.rgba");
+        var pbrRgba = Path.Combine(source, "paint-1-pbr.rgba");
+        File.WriteAllBytes(albedoPng, new byte[] { 1, 2, 3, 4 });
+        File.WriteAllBytes(pbrPng, new byte[] { 5, 6, 7, 8 });
+        File.WriteAllBytes(albedoRgba, new byte[] { 9, 10, 11, 12 });
+        File.WriteAllBytes(pbrRgba, new byte[] { 13, 14, 15, 16 });
+        var manifest = Path.Combine(source, "paint-1.json");
+        File.WriteAllText(manifest, """{"schema":"meccha_paint_texture_export_v1","texture_size":1024,"albedo_rgba":"paint-1-albedo.rgba","pbr_rgba":"paint-1-pbr.rgba","albedo_png":"paint-1-albedo.png","pbr_png":"paint-1-pbr.png"}""");
+        var archive = Path.Combine(root, "paint-1.mcpaint");
+        PaintTextureArchive.Write(archive, manifest, albedoRgba, pbrRgba, albedoPng, pbrPng);
+
+        using (var zip = ZipFile.OpenRead(archive))
+        {
+            var entry = zip.GetEntry("manifest.json");
+            Assert(entry is not null, "the archive must contain a manifest");
+            using var reader = new StreamReader(entry!.Open());
+            var json = JsonNode.Parse(reader.ReadToEnd())!.AsObject();
+            Assert(json["albedo_png"]!.GetValue<string>() == "albedo.png" &&
+                   json["pbr_png"]!.GetValue<string>() == "pbr.png" &&
+                   json["albedo_rgba"]!.GetValue<string>() == "albedo.rgba" &&
+                   json["pbr_rgba"]!.GetValue<string>() == "pbr.rgba",
+                "the archive manifest must point at the packaged entry names");
+        }
+
+        var extracted = Path.Combine(root, "extracted");
+        PaintTextureArchive.Extract(archive, extracted);
+        Assert(File.Exists(Path.Combine(extracted, "albedo.png")) &&
+               File.Exists(Path.Combine(extracted, "pbr.png")),
+            "the archive must extract the packaged textures");
+
+        var legacyArchive = Path.Combine(root, "legacy.mcpaint");
+        using (var zip = ZipFile.Open(legacyArchive, ZipArchiveMode.Create))
+        {
+            var legacyManifest = zip.CreateEntry("manifest.json");
+            using (var writer = new StreamWriter(legacyManifest.Open()))
+                writer.Write("""{"schema":"meccha_paint_texture_export_v1","texture_size":1024,"albedo_rgba":"old-albedo.rgba","pbr_rgba":"old-pbr.rgba","albedo_png":"old-albedo.png","pbr_png":"old-pbr.png"}""");
+            foreach (var (name, bytes) in new[]
+                     {
+                         ("albedo.png", new byte[] { 1 }),
+                         ("pbr.png", new byte[] { 2 }),
+                         ("albedo.rgba", new byte[] { 3 }),
+                         ("pbr.rgba", new byte[] { 4 })
+                     })
+            {
+                var entry = zip.CreateEntry(name);
+                using var stream = entry.Open();
+                stream.Write(bytes, 0, bytes.Length);
+            }
+        }
+        var legacyExtracted = Path.Combine(root, "legacy");
+        PaintTextureArchive.Extract(legacyArchive, legacyExtracted);
+        var normalized = JsonNode.Parse(File.ReadAllText(Path.Combine(legacyExtracted, "manifest.json")))!.AsObject();
+        Assert(normalized["albedo_png"]!.GetValue<string>() == "albedo.png" &&
+               normalized["pbr_png"]!.GetValue<string>() == "pbr.png" &&
+               normalized["albedo_rgba"]!.GetValue<string>() == "albedo.rgba" &&
+               normalized["pbr_rgba"]!.GetValue<string>() == "pbr.rgba",
+            "extraction must normalize legacy manifests to the packaged entry names");
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+            Directory.Delete(root, true);
+    }
 }
 
 static void ProfileRefreshSupportsFukuyoka()
