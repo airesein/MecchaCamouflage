@@ -506,6 +506,212 @@ public sealed class HostSession
         return new PaintTextureImportResult(true, "", reply.Stage);
     }
 
+    public async Task<PaintTextureReuseResult> ReusePaintTextureAsync(
+        string manifestPath,
+        double? brushSizeTexels = null,
+        int? stepTexels = null,
+        int? textureSize = null,
+        string? bodyType = null,
+        CancellationToken cancellationToken = default)
+    {
+        var local = await ImportPaintTextureAsync(manifestPath, cancellationToken);
+        if (!local.Success)
+            return new PaintTextureReuseResult(false, local.Message, local.Stage, false, false);
+
+        var replay = await ReplayPaintTextureAsync(
+            brushSizeTexels,
+            stepTexels,
+            textureSize,
+            bodyType,
+            cancellationToken);
+        if (!replay.Success)
+        {
+            var message = "The paint export was imported locally, but painting it onto the body could not start: " +
+                          (string.IsNullOrWhiteSpace(replay.Message) ? "unknown error" : replay.Message);
+            Log.Warn("Reuse Paint failed: " + message);
+            return new PaintTextureReuseResult(
+                false,
+                message,
+                replay.Stage,
+                true,
+                false,
+                replay.TextureSize,
+                replay.StrokeCount);
+        }
+
+        return new PaintTextureReuseResult(
+            true,
+            "Paint texture imported and painted onto the body.",
+            replay.Stage,
+            true,
+            true,
+            replay.TextureSize,
+            replay.StrokeCount);
+    }
+
+    public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync(
+        double? brushSizeTexels = null,
+        int? stepTexels = null,
+        int? textureSize = null,
+        string? bodyType = null,
+        CancellationToken cancellationToken = default)
+    {
+        int runGeneration;
+        lock (paintStateGate)
+        {
+            if (PaintRunning || nativePaintMayBeRunning)
+            {
+                const string message = "Stop the active paint before replaying a paint export.";
+                Log.Warn("Paint replay failed: " + message);
+                return new PaintTextureReplayResult(false, message, "paint_running");
+            }
+            PaintRunning = true;
+            activePaintKind = PaintKind.Standard;
+            runGeneration = ++nextPaintGeneration;
+            activePaintGeneration = runGeneration;
+            cancelState = PaintCancelState.None;
+            cancelPaintGeneration = 0;
+            paintRequestDispatchGeneration = 0;
+        }
+        currentPaintStartedAt = DateTimeOffset.UtcNow;
+        currentProgressIsServerPaint = true;
+        finalProgressLogged = false;
+        ResetReplayPassLog();
+        TryDeleteProgressSnapshot();
+        try
+        {
+            using var process = Runtime.FindGameProcess(Settings.GameProcessName);
+            if (process is null)
+            {
+                const string failureMessage = "Game process not found.";
+                Log.Warn(failureMessage);
+                return new PaintTextureReplayResult(false, failureMessage, "process_missing");
+            }
+            if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
+            {
+                const string failureMessage = "Bridge is not connected.";
+                Log.Warn(failureMessage);
+                return new PaintTextureReplayResult(false, failureMessage, "bridge_missing");
+            }
+            if (!TryBeginPaintDispatch(runGeneration))
+            {
+                const string failureMessage = "Paint: canceled.";
+                Log.Info(failureMessage);
+                return new PaintTextureReplayResult(false, failureMessage, "cancelled");
+            }
+
+            var payload = new Dictionary<string, object>
+            {
+                ["type"] = "replay_paint_texture"
+            };
+            if (brushSizeTexels is not null)
+                payload["brush_size_texels"] = brushSizeTexels.Value;
+            if (stepTexels is not null)
+                payload["step_texels"] = stepTexels.Value;
+            if (textureSize is not null)
+                payload["texture_size"] = textureSize.Value;
+            if (!string.IsNullOrWhiteSpace(bodyType))
+                payload["body_type"] = bodyType.Trim();
+
+            Log.Info("Reuse Paint: painting the saved texture onto the body. This may take a while.");
+            var response = await Runtime.SendPaintAsync(
+                JsonSerializer.Serialize(payload),
+                cancellationToken);
+            var message = FriendlyBridgeMessage(response.Message.Length > 0 ? response.Message : response.Stage);
+            var (replyTextureSize, strokeCount) = ParseReplayMetadata(response.Raw);
+            if (response.Success)
+            {
+                lock (paintStateGate)
+                {
+                    if (activePaintGeneration == runGeneration)
+                        nativePaintMayBeRunning = false;
+                }
+                LogFinalProgressOnce();
+                var completed = strokeCount > 0
+                    ? $"Reuse Paint: painted {strokeCount} UV strokes onto the body | size={replyTextureSize}"
+                    : "Reuse Paint: saved texture painted onto the body.";
+                Log.Info(completed);
+                return new PaintTextureReplayResult(
+                    true,
+                    completed,
+                    response.Stage,
+                    replyTextureSize,
+                    strokeCount);
+            }
+            if (IsPaintCancellationMessage(message))
+            {
+                lock (paintStateGate)
+                {
+                    if (activePaintGeneration == runGeneration)
+                        nativePaintMayBeRunning = false;
+                }
+                LogFinalProgressOnce();
+                Log.Info(message);
+                return new PaintTextureReplayResult(
+                    false,
+                    message,
+                    response.Stage,
+                    replyTextureSize,
+                    strokeCount);
+            }
+            lock (paintStateGate)
+            {
+                if (activePaintGeneration == runGeneration)
+                    nativePaintMayBeRunning = false;
+            }
+            LogFailureProgressOnce();
+            Log.Error(message);
+            var failureDetail = PaintFailureDetail(response);
+            if (failureDetail is not null)
+                Log.Warn("Paint replay detail: " + failureDetail);
+            return new PaintTextureReplayResult(
+                false,
+                message,
+                response.Stage,
+                replyTextureSize,
+                strokeCount);
+        }
+        finally
+        {
+            lock (paintStateGate)
+            {
+                if (activePaintGeneration == runGeneration)
+                {
+                    PaintRunning = false;
+                    nativePaintMayBeRunning = false;
+                    activePaintKind = null;
+                    activePaintGeneration = 0;
+                    cancelState = PaintCancelState.None;
+                    cancelPaintGeneration = 0;
+                    paintRequestDispatchGeneration = 0;
+                }
+            }
+            currentProgressIsServerPaint = false;
+        }
+    }
+
+    private static (int TextureSize, int StrokeCount) ParseReplayMetadata(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return (0, 0);
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            if (!document.RootElement.TryGetProperty("metadata", out var metadata) ||
+                metadata.ValueKind != JsonValueKind.Object)
+            {
+                return (0, 0);
+            }
+            return (
+                Int(metadata, "texture_size", 0),
+                Int(metadata, "replay_strokes_total", 0));
+        }
+        catch
+        {
+            return (0, 0);
+        }
+    }
+
     public object GetLatestPaintExport()
     {
         var directory = Paths.PaintExportsDirectory;

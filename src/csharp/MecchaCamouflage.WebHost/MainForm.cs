@@ -1276,8 +1276,17 @@ public sealed class MainForm : Form
             : "";
         if (string.IsNullOrWhiteSpace(manifestPath))
             return new { success = false, message = "Export the current paint first." };
-        var result = await session.ImportPaintTextureAsync(manifestPath);
-        return new { success = result.Success, message = result.Message, stage = result.Stage };
+        var result = await session.ReusePaintTextureAsync(manifestPath);
+        return new
+        {
+            success = result.Success,
+            message = result.Message,
+            stage = result.Stage,
+            localImportSucceeded = result.LocalImportSucceeded,
+            replaySucceeded = result.ReplaySucceeded,
+            textureSize = result.TextureSize,
+            strokeCount = result.StrokeCount
+        };
     }
 
     private bool TryReadImageDesign(JsonElement payload, out ImagePaintSettings design, out string message)

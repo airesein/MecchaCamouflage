@@ -15,6 +15,18 @@ Emissive are written atomically through paint channel 7. Explicit Emissive
 writes prevent a previous glowing value from persisting in a newly painted
 surface.
 
+## Reuse Paint
+
+Reuse Paint performs two steps. It first imports the `.mcpaint` archive locally
+so Preview/Unpreview can see the saved material, then sends
+`replay_paint_texture`. The bridge reads the current game Albedo and packed PBR
+textures, samples them on a UV grid (direct `v`, no image-editor flip), skips
+fully transparent texels, converts sRGB albedo to linear, and submits
+`PaintAtUVWithBrush` strokes for channel 7 through the normal async paint job.
+The local import is never the production replication transport. Direct UV
+replay requires the same body and UV layout that produced the export, and its
+duration grows with the texel grid; brush size and step are request options.
+
 ## Queue telemetry and completion
 
 The visible dotted frontier was caused by the bridge submitting strokes much

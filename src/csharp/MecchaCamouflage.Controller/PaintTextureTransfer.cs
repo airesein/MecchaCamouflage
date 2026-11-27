@@ -18,6 +18,22 @@ public sealed record PaintTextureImportResult(
     string Message,
     string Stage);
 
+public sealed record PaintTextureReplayResult(
+    bool Success,
+    string Message,
+    string Stage,
+    int TextureSize = 0,
+    int StrokeCount = 0);
+
+public sealed record PaintTextureReuseResult(
+    bool Success,
+    string Message,
+    string Stage,
+    bool LocalImportSucceeded,
+    bool ReplaySucceeded,
+    int TextureSize = 0,
+    int StrokeCount = 0);
+
 public static class PaintTextureArchive
 {
     public const string Extension = ".mcpaint";

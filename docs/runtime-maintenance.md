@@ -129,6 +129,16 @@ performance captures.
 not become a production paint fallback, and neither a packed RPC nor the old
 internal no-resend / receiver-queue routes may be reintroduced.
 
+Reuse Paint is a production paint operation. It imports the saved `.mcpaint`
+locally for Preview/Unpreview compatibility, then issues `replay_paint_texture`.
+The bridge reads the live Albedo and packed PBR textures, samples them directly
+in UV space on a texel grid, skips fully transparent pixels, and submits the
+resulting channel-7 strokes through `PaintAtUVWithBrush` and the normal async
+job. It does not use `ImportChannelFromBytes` as the paint transport and does
+not route through the four-face Image Paint planner. Reuse requires the same
+body and UV layout as the export; it may take time proportional to the texture
+grid, so keep the existing paint progress and cancellation paths active.
+
 Auto Detect applies only to Paint regions. It obtains one global dominant
 material pattern from `GetDominantPaintMaterialPatterns`, including M/R/E, and
 therefore intentionally ignores the manual Paint PBR values for that request.

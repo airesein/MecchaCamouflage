@@ -2408,8 +2408,11 @@ async function reuseCurrentPaint() {
   const typedPath = byId("image-export-path").value.trim();
   const manifestPath = typedPath || lastPaintExportManifest;
   if (!manifestPath) throw new Error(i18n("error.image.export.none"));
-  const result = await send("importCurrentPaint", { manifestPath }, 180000);
-  if (!result?.success) throw new Error(result?.message || "The saved paint could not be reused.");
+  toast(i18n("toast.image.export.replaying"));
+  const result = await send("importCurrentPaint", { manifestPath }, 3600000);
+  if (!result?.success) {
+    throw new Error(result?.message || "The saved paint was imported, but painting it onto the body could not start.");
+  }
   lastPaintExportManifest = manifestPath;
   toast(i18n("toast.image.export.reused"));
 }

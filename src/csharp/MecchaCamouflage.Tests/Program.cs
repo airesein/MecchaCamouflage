@@ -102,6 +102,8 @@ var tests = new List<(string Name, Action Run)>
     ("legacy image transforms migrate to individual layers", LegacyImageTransformsMigrateToIndividualLayers),
     ("image preset round-trips an uncompressed container", ImagePresetRoundTripsUncompressedContainer),
     ("paint texture archive normalizes manifest texture names", PaintTextureArchiveNormalizesManifest),
+    ("reuse paint requests direct UV replay after local import", ReusePaintRequestsDirectUvReplay),
+    ("native replay samples the UV texture directly", NativeReplaySamplesUvTextureDirectly),
     ("v1 image preset expands global transforms to layers", V1ImagePresetExpandsGlobalTransformsToLayers),
     ("GUI image save persists the active preset state", GuiImageSavePersistsActivePresetState),
     ("legacy image config migrates to active image state", LegacyImageConfigMigratesToDiskLibrary),
@@ -5795,6 +5797,96 @@ static void DevelopmentBuildsUseIsolatedVersionScopes()
     File.WriteAllText(Path.Combine(first.ImagePresetsDirectory, "marker"), "first build");
     Assert(!File.Exists(Path.Combine(second.ImagePresetsDirectory, "marker")),
         "distinct build identities must not share Image preset storage");
+}
+
+static void ReusePaintRequestsDirectUvReplay()
+{
+    var root = FindRepositoryRoot();
+    var host = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+    var form = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var app = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+
+    var reuseStart = host.IndexOf(
+        "public async Task<PaintTextureReuseResult> ReusePaintTextureAsync",
+        StringComparison.Ordinal);
+    var replayStart = host.IndexOf(
+        "public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync",
+        StringComparison.Ordinal);
+    Assert(reuseStart >= 0 && replayStart > reuseStart,
+        "HostSession must expose separate Reuse Paint and local replay methods");
+    var reuse = host[reuseStart..replayStart];
+    Assert(reuse.Contains("await ImportPaintTextureAsync(manifestPath", StringComparison.Ordinal),
+        "Reuse Paint must still perform the local .mcpaint import first");
+    Assert(reuse.Contains("await ReplayPaintTextureAsync(", StringComparison.Ordinal),
+        "Reuse Paint must run direct UV replay after the local import succeeds");
+
+    var replayEnd = host.IndexOf(
+        "private static (int TextureSize, int StrokeCount) ParseReplayMetadata",
+        replayStart,
+        StringComparison.Ordinal);
+    Assert(replayEnd > replayStart, "replay method boundary must remain discoverable");
+    var replay = host[replayStart..replayEnd];
+    Assert(replay.Contains("[\"type\"] = \"replay_paint_texture\"", StringComparison.Ordinal),
+        "Reuse Paint must send replay_paint_texture rather than only import_paint_texture");
+    Assert(replay.Contains("Runtime.SendPaintAsync", StringComparison.Ordinal),
+        "direct UV replay must use the production paint command path");
+    Assert(!replay.Contains("import_paint_texture", StringComparison.Ordinal),
+        "replay must read the game texture instead of using local import as its transport");
+    Assert(form.Contains("session.ReusePaintTextureAsync(manifestPath)", StringComparison.Ordinal),
+        "the Reuse Paint command must invoke import plus direct UV replay");
+    Assert(app.Contains("toast.image.export.replaying", StringComparison.Ordinal) &&
+           app.Contains("toast.image.export.reused", StringComparison.Ordinal),
+        "the web UI must show replay progress and a completion toast");
+}
+
+static void NativeReplaySamplesUvTextureDirectly()
+{
+    var root = FindRepositoryRoot();
+    var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
+
+    Assert(bridge.Contains("\\\"type\\\":\\\"replay_paint_texture\\\"", StringComparison.Ordinal),
+        "native request matching must include replay_paint_texture");
+    Assert(bridge.Contains("is_replay_paint_texture_request", StringComparison.Ordinal),
+        "native dispatch must route the replay command explicitly");
+    Assert(bridge.Contains("start_mesh_first_paint_async_job(job->request, job)", StringComparison.Ordinal),
+        "replay must reuse the existing async paint job dispatcher");
+
+    var start = bridge.IndexOf(
+        "auto replay_paint_texture_on_game_thread",
+        StringComparison.Ordinal);
+    var end = bridge.IndexOf(
+        "auto start_mesh_first_paint_async_job",
+        start,
+        StringComparison.Ordinal);
+    Assert(start >= 0 && end > start, "native replay handler must remain discoverable");
+    var body = bridge[start..end];
+    Assert(body.Contains("mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo)", StringComparison.Ordinal),
+        "replay must read the current albedo texture");
+    Assert(body.Contains("sdk::EPaintChannel::Metallic", StringComparison.Ordinal),
+        "replay must read the packed PBR texture");
+    Assert(body.Contains("albedo.bytes[offset + 3U] == 0U", StringComparison.Ordinal),
+        "replay must skip fully transparent texels");
+    Assert(body.Contains("albedo.bytes[offset]", StringComparison.Ordinal) &&
+           body.Contains("packed_pbr.bytes[offset]", StringComparison.Ordinal),
+        "replay must sample albedo and packed PBR at the same direct texture index");
+    Assert(body.Contains("runtime_contract::appearance_srgb_to_linear(r)", StringComparison.Ordinal),
+        "replay must convert sRGB albedo to linear values");
+    Assert(body.Contains("sdk_make_uv_stroke(", StringComparison.Ordinal) &&
+           body.Contains("sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive", StringComparison.Ordinal),
+        "replay must build channel-7 UV strokes");
+    Assert(body.Contains("sdk::EPaintChannelApplyMode::Override", StringComparison.Ordinal),
+        "replay strokes must use Override apply mode");
+    Assert(body.Contains("texture_size_denominator", StringComparison.Ordinal),
+        "replay must map texture texels directly to UV without the 4-face image path");
+    Assert(!body.Contains("image_paint", StringComparison.Ordinal) &&
+           !body.Contains("front_region_mode", StringComparison.Ordinal),
+        "direct UV replay must not reuse the 4-face Image Paint planner");
+    Assert(bridge.Contains("sdk_call_paint_at_uv_with_brush", StringComparison.Ordinal) &&
+           bridge.Contains("PaintAtUVWithBrush", StringComparison.Ordinal),
+        "replay must keep the game's PaintAtUVWithBrush production route");
 }
 
 static string FindRepositoryRoot()

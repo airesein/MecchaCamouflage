@@ -1,4 +1,4 @@
-#ifndef NOMINMAX
+﻿#ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #define WIN32_LEAN_AND_MEAN
@@ -937,6 +937,7 @@ namespace
 
     auto paint_full_route_native_direct(const std::string& request) -> std::string;
     auto is_mesh_first_paint_request(const std::string& request) -> bool;
+    auto is_replay_paint_texture_request(const std::string& request) -> bool;
     auto is_image_guide_request(const std::string& request) -> bool;
     auto image_guide_on_game_thread(const std::string& request) -> std::string;
     auto paint_mesh_first_on_game_thread(const std::string& request,
@@ -24075,6 +24076,418 @@ namespace
         }
     }
 
+    auto replay_paint_texture_on_game_thread(const std::string& request,
+                                             const std::shared_ptr<QueuedPaintJob>& queued_job) -> std::string
+    {
+        paint_dispatch_set_debug_stage(PaintDispatchDebugStage::ParseRequest);
+        if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+        {
+            return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+        }
+        if (!queued_job)
+        {
+            return response_json(false,
+                                 "mesh_first_async_required",
+                                 0,
+                                 1,
+                                 "direct UV replay requires the async queued dispatcher",
+                                 "\"route\":\"replay_paint_texture\",\"replay_blocked\":true");
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
+            if (g_mesh_first_batch_job)
+            {
+                return response_json(false,
+                                     "mesh_first_busy",
+                                     0,
+                                     1,
+                                     "direct UV replay is already running",
+                                     "\"route\":\"replay_paint_texture\",\"replay_blocked\":true");
+            }
+        }
+
+        const int requested_texture_size =
+            json_int_field(request, "texture_size", 0, 0, 8192);
+        const int brush_size_texels = static_cast<int>(
+            std::lround(clamp_range(
+                json_number_field(request, "brush_size_texels", 6.0),
+                1.0,
+                64.0)));
+        const int step_texels =
+            json_int_field(request, "step_texels", 3, 1, 256);
+        const auto body_type =
+            lower_copy(json_string_field(request, "body_type", ""));
+
+        std::string metadata = "\"route\":\"replay_paint_texture\"";
+        metadata += ",\"replay_route\":\"direct_uv_texture_replay\"";
+        metadata += ",\"local_texture_import_required\":false";
+        metadata += ",\"brush_size_texels\":" + std::to_string(brush_size_texels);
+        metadata += ",\"step_texels\":" + std::to_string(step_texels);
+        metadata += ",\"body_type\":\"" + json_escape(body_type) + "\"";
+
+        Reflection ref{};
+        std::string failure{};
+        paint_dispatch_set_debug_stage(PaintDispatchDebugStage::ResolveContext);
+        if (!ref.init(failure))
+        {
+            return response_json(false,
+                                 "sdk_update_required",
+                                 0,
+                                 1,
+                                 failure.empty() ? "SDK reflection init failed" : failure,
+                                 metadata + ",\"sdk_resolution_exception\":true");
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            return response_json(false,
+                                 ex.stage.c_str(),
+                                 0,
+                                 1,
+                                 ex.what(),
+                                 metadata + ",\"sdk_resolution_exception\":true");
+        }
+        if (!ctx.ok)
+        {
+            return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, metadata);
+        }
+        if (!ctx.local_paint_at_uv_function)
+        {
+            return response_json(false,
+                                 "mesh_direct_paint_unavailable",
+                                 0,
+                                 1,
+                                 "PaintAtUVWithBrush is unavailable; direct UV replay cannot run",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
+
+        const auto albedo =
+            mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+        const auto packed_pbr =
+            mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Metallic);
+        metadata += ",\"albedo_ok\":" + std::string(json_bool(albedo.ok));
+        metadata += ",\"albedo_failure\":\"" + json_escape(albedo.failure) + "\"";
+        metadata += ",\"pbr_ok\":" + std::string(json_bool(packed_pbr.ok));
+        metadata += ",\"pbr_failure\":\"" + json_escape(packed_pbr.failure) + "\"";
+        if (!albedo.ok || !packed_pbr.ok)
+        {
+            return response_json(false,
+                                 "replay_paint_texture_channel_failed",
+                                 0,
+                                 1,
+                                 "albedo=" + albedo.failure + ";pbr=" + packed_pbr.failure,
+                                 metadata);
+        }
+        if (albedo.bytes.empty() ||
+            albedo.bytes.size() != packed_pbr.bytes.size() ||
+            (albedo.bytes.size() % 4U) != 0U)
+        {
+            return response_json(false,
+                                 "replay_paint_texture_layout_mismatch",
+                                 0,
+                                 1,
+                                 "the current paint texture has incompatible RGBA channels",
+                                 metadata);
+        }
+        const std::size_t pixel_count = albedo.bytes.size() / 4U;
+        const int texture_size =
+            static_cast<int>(std::lround(std::sqrt(static_cast<double>(pixel_count))));
+        if (texture_size <= 0 ||
+            static_cast<std::size_t>(texture_size) *
+                    static_cast<std::size_t>(texture_size) !=
+                pixel_count)
+        {
+            return response_json(false,
+                                 "replay_paint_texture_not_square",
+                                 0,
+                                 1,
+                                 "the current paint texture is not a square RGBA image",
+                                 metadata);
+        }
+        if (requested_texture_size > 0 && requested_texture_size != texture_size)
+        {
+            return response_json(false,
+                                 "replay_paint_texture_size_mismatch",
+                                 0,
+                                 1,
+                                 "texture_size does not match the current game paint texture",
+                                 metadata +
+                                     ",\"texture_size\":" + std::to_string(texture_size) +
+                                     ",\"requested_texture_size\":" +
+                                     std::to_string(requested_texture_size));
+        }
+        metadata += ",\"texture_size\":" + std::to_string(texture_size);
+        metadata += ",\"texture_pixels\":" + std::to_string(pixel_count);
+
+        sdk::FRuntimeBrushSettings base_brush{};
+        safe_copy(&base_brush,
+                  reinterpret_cast<const void*>(
+                      ctx.component +
+                      sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings),
+                  sizeof(base_brush));
+        base_brush.Hardness = 1.0f;
+        base_brush.Opacity = 1.0f;
+        base_brush.Spacing = 1.0f;
+        base_brush.Falloff = sdk::EBrushFalloff::Spherical;
+        base_brush.BlendMode = sdk::EPaintBlendMode::Normal;
+        sdk::FRuntimeBrushSettings brush = base_brush;
+        const double texture_size_denominator =
+            static_cast<double>(std::max(1, texture_size - 1));
+        const double brush_radius_uv =
+            static_cast<double>(brush_size_texels) /
+            static_cast<double>(std::max(1, texture_size));
+        brush.Radius = static_cast<float>(brush_radius_uv);
+        metadata += ",\"brush_radius_uv\":" + std::to_string(brush_radius_uv);
+
+        std::vector<sdk::FPaintStroke> strokes{};
+        const int grid_width = (texture_size + step_texels - 1) / step_texels;
+        strokes.reserve(static_cast<std::size_t>(grid_width) *
+                        static_cast<std::size_t>(grid_width));
+        int transparent_skipped = 0;
+        for (int y = 0; y < texture_size; y += step_texels)
+        {
+            const double v =
+                static_cast<double>(y) / texture_size_denominator;
+            for (int x = 0; x < texture_size; x += step_texels)
+            {
+                const std::size_t offset =
+                    (static_cast<std::size_t>(y) *
+                         static_cast<std::size_t>(texture_size) +
+                     static_cast<std::size_t>(x)) *
+                    4U;
+                if (albedo.bytes[offset + 3U] == 0U)
+                {
+                    ++transparent_skipped;
+                    continue;
+                }
+                const double u =
+                    static_cast<double>(x) / texture_size_denominator;
+                const double r =
+                    static_cast<double>(albedo.bytes[offset]) / 255.0;
+                const double g =
+                    static_cast<double>(albedo.bytes[offset + 1U]) / 255.0;
+                const double b =
+                    static_cast<double>(albedo.bytes[offset + 2U]) / 255.0;
+                const double metallic =
+                    static_cast<double>(packed_pbr.bytes[offset]) / 255.0;
+                const double roughness =
+                    static_cast<double>(packed_pbr.bytes[offset + 1U]) / 255.0;
+                const double emissive =
+                    static_cast<double>(packed_pbr.bytes[offset + 2U]) / 255.0;
+                const auto channel = sdk_make_channel(
+                    runtime_contract::appearance_srgb_to_linear(r),
+                    runtime_contract::appearance_srgb_to_linear(g),
+                    runtime_contract::appearance_srgb_to_linear(b),
+                    metallic,
+                    roughness,
+                    emissive,
+                    sdk::EPaintChannelApplyMode::Override);
+                strokes.push_back(sdk_make_uv_stroke(
+                    u,
+                    v,
+                    channel,
+                    brush,
+                    sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
+            }
+        }
+        metadata += ",\"replay_strokes_total\":" + std::to_string(strokes.size());
+        metadata += ",\"replay_transparent_skipped\":" + std::to_string(transparent_skipped);
+        metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
+        metadata += ",\"local_route_mode\":\"native_recorded_paint\"";
+        metadata += ",\"paint_target_channel\":\"albedo_metallic_roughness_emissive\"";
+        metadata += ",\"authoritative_replay\":\"direct_game_recorded_strokes\"";
+        if (strokes.empty())
+        {
+            return response_json(false,
+                                 "replay_paint_texture_empty",
+                                 0,
+                                 1,
+                                 "the current paint texture produced no opaque replay strokes",
+                                 metadata);
+        }
+
+        const auto total_preprocess_start = std::chrono::high_resolution_clock::now();
+        auto async_job = std::make_shared<MeshFirstServerBatchAsyncJob>();
+        async_job->queued = queued_job;
+        async_job->controller = ctx.controller;
+        async_job->pawn = ctx.pawn;
+        async_job->component = ctx.component;
+        async_job->component_class = safe_read<std::uintptr_t>(ctx.component + OffClass);
+        async_job->component_outer = safe_read<std::uintptr_t>(ctx.component + OffOuter);
+        async_job->k2_get_pawn_function = ctx.k2_get_pawn_function;
+        async_job->local_paint_at_uv_function = ctx.local_paint_at_uv_function;
+        async_job->direct_queue_manager =
+            ref.find_first_instance("RuntimePaintReplicationManager");
+        async_job->direct_recorded_count_function =
+            ref.find_function(ctx.component, "GetRecordedStrokeCount");
+        if (live_uobject(async_job->direct_queue_manager))
+        {
+            async_job->direct_queue_component_count_function =
+                ref.find_function(async_job->direct_queue_manager,
+                                  "GetQueuedStrokeCountForComponent");
+            async_job->direct_queue_manager_count_function =
+                ref.find_function(async_job->direct_queue_manager,
+                                  "GetQueuedStrokeCount");
+            async_job->direct_queue_pressure_function =
+                ref.find_function(async_job->direct_queue_manager,
+                                  "GetReplicationPressure");
+            if (const auto outgoing_batches_property =
+                    find_object_property(
+                        ref,
+                        async_job->direct_queue_manager,
+                        "QueuedOutgoingBatches"))
+            {
+                async_job->direct_queue_outgoing_batches_offset =
+                    prop_offset(outgoing_batches_property);
+            }
+        }
+        const int reported_batches_per_second =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxOutgoingNetworkBatchesPerSecond",
+                -1);
+        const int reported_strokes_per_batch =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxOutgoingStrokesPerBatch",
+                -1);
+        const int min_remote_frames_after_local_paint =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MinRemotePaintFramesAfterLocalPaint",
+                0);
+        const int max_adaptive_remote_frame_interval =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxAdaptiveRemotePaintFrameInterval",
+                0);
+        async_job->reported_max_render_target_writes_per_frame =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxReplicatedPaintRenderTargetWritesPerFrame",
+                -1);
+        bool adaptive_remote_interval = false;
+        if (const auto adaptive_property =
+                find_object_property(
+                    ref,
+                    async_job->direct_queue_manager,
+                    "bEnableAdaptiveRemotePaintInterval"))
+        {
+            sdk_read_reflected_bool(
+                adaptive_property,
+                reinterpret_cast<const std::uint8_t*>(
+                    async_job->direct_queue_manager),
+                adaptive_remote_interval);
+        }
+        async_job->replication_pacing =
+            runtime_contract::paint_replication_pacing_plan(
+                reported_batches_per_second,
+                reported_strokes_per_batch,
+                async_job->reported_max_render_target_writes_per_frame,
+                runtime_contract::NativeRecordedPaintMaxCallsPerTick,
+                min_remote_frames_after_local_paint,
+                adaptive_remote_interval,
+                max_adaptive_remote_frame_interval);
+        async_job->local_dispatch_delay_ms =
+            async_job->replication_pacing.cadence_ms;
+        async_job->local_dispatch_peak_delay_ms =
+            async_job->replication_pacing.cadence_ms;
+        async_job->strokes = std::move(strokes);
+        async_job->initial_stroke_count =
+            static_cast<int>(async_job->strokes.size());
+        async_job->metadata =
+            metadata +
+            ",\"local_visual_sync_mode\":\"paint_at_uv_with_brush_native_replication\"" +
+            ",\"local_batch_strategy\":\"single_direct_lane\"" +
+            ",\"native_queue_backpressure\":true";
+        async_job->texture_size = texture_size;
+        async_job->replay_front = 0;
+        async_job->replay_side = 0;
+        async_job->replay_back = 0;
+        async_job->replay_fill_end = 0;
+        const int local_sample_batch_limit =
+            async_job->replication_pacing.calls_per_tick;
+        async_job->local_render_target_write_budget =
+            local_sample_batch_limit *
+            std::max(1,
+                     runtime_contract::paint_channel_write_cost(
+                         static_cast<int>(
+                             sdk::EPaintChannel::
+                                 AlbedoMetallicRoughnessEmissive)));
+        if (async_job->reported_max_render_target_writes_per_frame > 0)
+        {
+            async_job->local_render_target_write_budget =
+                std::min(
+                    async_job->local_render_target_write_budget,
+                    async_job->reported_max_render_target_writes_per_frame);
+        }
+        async_job->metadata +=
+            ",\"local_logical_sample_batch_limit\":" +
+            std::to_string(local_sample_batch_limit);
+        async_job->metadata +=
+            ",\"replication_pacing_source\":\"" +
+            std::string(
+                reported_batches_per_second > 0 &&
+                        reported_strokes_per_batch > 0 &&
+                        async_job->reported_max_render_target_writes_per_frame > 0
+                    ? "reflected_network_and_receiver_limits"
+                    : "supported_build_fallback") +
+            "\"";
+        async_job->metadata +=
+            ",\"native_queue_component_counter_available\":" +
+            std::string(json_bool(async_job->direct_queue_component_count_function != 0));
+        const auto total_preprocess_end =
+            std::chrono::high_resolution_clock::now();
+        const double total_preprocess_ms =
+            std::chrono::duration<double, std::milli>(
+                total_preprocess_end - total_preprocess_start)
+                .count();
+        async_job->preprocessing_ms = total_preprocess_ms;
+        async_job->metadata +=
+            ",\"preprocessing_ms\":" + std::to_string(total_preprocess_ms);
+        async_job->started = std::chrono::steady_clock::now();
+        async_job->local_sync_started = true;
+        async_job->local_sync_started_at = async_job->started;
+        async_job->phase = MeshFirstBatchPhase::LocalPaint;
+        {
+            std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
+            if (!g_accepting_bridge_commands.load(std::memory_order_acquire) &&
+                queued_paint_cancel_reason(queued_job) == PaintCancelReason::None)
+            {
+                request_queued_paint_cancel(queued_job, "bridge_stopping");
+            }
+            if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+            {
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+            }
+            g_mesh_first_batch_job = async_job;
+            queued_job->state.store(static_cast<int>(PaintJobState::Async),
+                                    std::memory_order_release);
+        }
+        write_bridge_progress(
+            "mesh_direct_paint_begin",
+            "direct UV texture replay prepared",
+            0,
+            static_cast<int>(async_job->strokes.size()),
+            0.0,
+            mesh_first_progress_extra(async_job,
+                                      async_job->phase,
+                                      false,
+                                      "running"));
+        post_paint_dispatch_message();
+        return {};
+    }
+
     auto start_mesh_first_paint_async_job(const std::string& request,
                                           const std::shared_ptr<QueuedPaintJob>& queued_job) -> bool
     {
@@ -24088,7 +24501,10 @@ namespace
                                       queued_paint_cancel_response(queued_job, "mesh_paint_cancelled"));
             return true;
         }
-        const auto response = paint_mesh_first_on_game_thread(request, queued_job);
+        const auto response =
+            is_replay_paint_texture_request(request)
+                ? replay_paint_texture_on_game_thread(request, queued_job)
+                : paint_mesh_first_on_game_thread(request, queued_job);
         if (!response.empty())
         {
             complete_queued_paint_job(queued_job, response);
@@ -28746,6 +29162,11 @@ namespace
 
 
 
+    auto is_replay_paint_texture_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"replay_paint_texture\"") != std::string::npos;
+    }
+
     auto is_import_paint_texture_request(const std::string& request) -> bool
     {
         return request.find("\"type\":\"import_paint_texture\"") != std::string::npos;
@@ -29070,6 +29491,11 @@ namespace
                 mark_queued_paint_job_dispatched(job);
                 const auto response = image_guide_on_game_thread(job->request);
                 complete_queued_paint_job(job, response);
+                continue;
+            }
+            if (is_replay_paint_texture_request(job->request))
+            {
+                start_mesh_first_paint_async_job(job->request, job);
                 continue;
             }
             if (is_mesh_first_paint_request(job->request))
@@ -36100,7 +36526,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         }
         if (line.find("\"type\":\"capabilities\"") != std::string::npos)
         {
-            std::string commands = "[\"ping\",\"capabilities\",\"esp_native_present\",\"esp_native_present_status\",\"esp_native_present_probe\",\"appearance_present_probe\",\"appearance_emission_isolation_probe\",\"appearance_preview_emissive_override\",\"paint_full_route\",\"image_guide\",\"cancel_paint\",\"detach\",\"shutdown\"]";
+            std::string commands = "[\"ping\",\"capabilities\",\"esp_native_present\",\"esp_native_present_status\",\"esp_native_present_probe\",\"appearance_present_probe\",\"appearance_emission_isolation_probe\",\"appearance_preview_emissive_override\",\"paint_full_route\",\"image_guide\",\"import_paint_texture\",\"export_paint_texture\",\"replay_paint_texture\",\"cancel_paint\",\"detach\",\"shutdown\"]";
             return std::string("{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,") +
                    "\"message\":\"ok\",\"timing_ms\":{}," +
                    "\"metadata\":{\"commands\":" + commands + "," +
@@ -36239,7 +36665,8 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
             return paint_full_route_native(line);
         }
         if (line.find("\"type\":\"import_paint_texture\"") != std::string::npos ||
-            line.find("\"type\":\"export_paint_texture\"") != std::string::npos)
+            line.find("\"type\":\"export_paint_texture\"") != std::string::npos ||
+            line.find("\"type\":\"replay_paint_texture\"") != std::string::npos)
         {
             return paint_full_route_native(line);
         }
