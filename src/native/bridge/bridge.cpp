@@ -949,6 +949,8 @@ namespace
     auto paint_replication_probe_on_game_thread(const std::string& request) -> std::string;
     auto is_import_paint_texture_request(const std::string& request) -> bool;
     auto import_paint_texture_on_game_thread(const std::string& request) -> std::string;
+    auto is_export_paint_texture_request(const std::string& request) -> bool;
+    auto export_paint_texture_on_game_thread(const std::string& request) -> std::string;
     auto auto_event_watch_record(std::uintptr_t object_address,
                                  std::uintptr_t function_address,
                                  std::uint8_t* params_bytes) -> void;
@@ -28857,6 +28859,123 @@ namespace
                              metadata);
     }
 
+    auto is_export_paint_texture_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"export_paint_texture\"") != std::string::npos;
+    }
+
+    auto export_paint_texture_on_game_thread(const std::string&) -> std::string
+    {
+        Reflection ref{};
+        std::string failure{};
+        if (!ref.init(failure))
+        {
+            return response_json(false,
+                                 "sdk_update_required",
+                                 0,
+                                 1,
+                                 failure.empty() ? "SDK reflection init failed" : failure,
+                                 "\"route\":\"export_paint_texture\"");
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            return response_json(false,
+                                 ex.stage.c_str(),
+                                 0,
+                                 1,
+                                 ex.what(),
+                                 "\"route\":\"export_paint_texture\",\"sdk_resolution_exception\":true");
+        }
+        if (!ctx.ok)
+        {
+            return response_json(false,
+                                 ctx.stage.c_str(),
+                                 0,
+                                 1,
+                                 ctx.message,
+                                 "\"route\":\"export_paint_texture\"");
+        }
+        std::string metadata = "\"route\":\"export_paint_texture\"";
+        metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
+        const auto albedo = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+        const auto packed_pbr = mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Metallic);
+        metadata += ",\"albedo_ok\":" + std::string(json_bool(albedo.ok));
+        metadata += ",\"albedo_failure\":\"" + json_escape(albedo.failure) + "\"";
+        metadata += ",\"pbr_ok\":" + std::string(json_bool(packed_pbr.ok));
+        metadata += ",\"pbr_failure\":\"" + json_escape(packed_pbr.failure) + "\"";
+        if (!albedo.ok || !packed_pbr.ok)
+        {
+            return response_json(false,
+                                 "export_paint_texture_channel_failed",
+                                 0,
+                                 1,
+                                 "albedo=" + albedo.failure + ";pbr=" + packed_pbr.failure,
+                                 metadata);
+        }
+        if (albedo.bytes.empty() ||
+            albedo.bytes.size() != packed_pbr.bytes.size() ||
+            (albedo.bytes.size() % 4U) != 0U)
+        {
+            return response_json(false,
+                                 "export_paint_texture_layout_mismatch",
+                                 0,
+                                 1,
+                                 "exported paint channels have incompatible byte layouts",
+                                 metadata);
+        }
+        const std::size_t pixel_count = albedo.bytes.size() / 4U;
+        const int texture_size = static_cast<int>(std::lround(std::sqrt(static_cast<double>(pixel_count))));
+        if (texture_size <= 0 ||
+            static_cast<std::size_t>(texture_size) * static_cast<std::size_t>(texture_size) != pixel_count)
+        {
+            return response_json(false,
+                                 "export_paint_texture_not_square",
+                                 0,
+                                 1,
+                                 "the paint texture is not a square RGBA image",
+                                 metadata);
+        }
+        const auto directory = runtime_log_dir_path();
+        if (directory.empty())
+        {
+            return response_json(false,
+                                 "export_paint_texture_directory_unavailable",
+                                 0,
+                                 1,
+                                 "the runtime log directory is unavailable",
+                                 metadata);
+        }
+        const auto stamp = std::to_wstring(GetTickCount64());
+        const auto albedo_path = directory + L"\\paint-export-albedo-" + stamp + L".rgba";
+        const auto pbr_path = directory + L"\\paint-export-pbr-" + stamp + L".rgba";
+        if (!write_binary_file_w(albedo_path, albedo.bytes) ||
+            !write_binary_file_w(pbr_path, packed_pbr.bytes))
+        {
+            return response_json(false,
+                                 "export_paint_texture_write_failed",
+                                 0,
+                                 1,
+                                 "could not write the exported paint texture",
+                                 metadata);
+        }
+        metadata += ",\"texture_size\":" + std::to_string(texture_size);
+        metadata += ",\"albedo_path\":\"" + json_escape(wstring_to_utf8(albedo_path)) + "\"";
+        metadata += ",\"pbr_path\":\"" + json_escape(wstring_to_utf8(pbr_path)) + "\"";
+        metadata += ",\"albedo_bytes\":" + std::to_string(albedo.bytes.size());
+        metadata += ",\"pbr_bytes\":" + std::to_string(packed_pbr.bytes.size());
+        return response_json(true,
+                             "export_paint_texture",
+                             0,
+                             0,
+                             "paint texture exported",
+                             metadata);
+    }
+
     auto drain_paint_jobs_on_game_thread() -> void
     {
         paint_dispatch_set_debug_stage(
@@ -28890,6 +29009,13 @@ namespace
             if (queued_paint_cancel_reason(job) != PaintCancelReason::None)
             {
                 complete_queued_paint_job(job, queued_paint_cancel_response(job));
+                continue;
+            }
+            if (is_export_paint_texture_request(job->request))
+            {
+                mark_queued_paint_job_dispatched(job);
+                const auto response = export_paint_texture_on_game_thread(job->request);
+                complete_queued_paint_job(job, response);
                 continue;
             }
             if (is_import_paint_texture_request(job->request))
@@ -36092,7 +36218,8 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         {
             return paint_full_route_native(line);
         }
-        if (line.find("\"type\":\"import_paint_texture\"") != std::string::npos)
+        if (line.find("\"type\":\"import_paint_texture\"") != std::string::npos ||
+            line.find("\"type\":\"export_paint_texture\"") != std::string::npos)
         {
             return paint_full_route_native(line);
         }

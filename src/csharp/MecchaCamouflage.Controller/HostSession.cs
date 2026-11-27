@@ -279,8 +279,7 @@ public sealed class HostSession
             return new PaintTextureExportResult(false, "Game process not found.", "", "", "", "", 0);
         if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
             return new PaintTextureExportResult(false, "Bridge is not connected.", "", "", "", "", 0);
-        const string payload =
-            "{\"type\":\"paint_replication_texture_probe\",\"research_texture_target\":\"resolved\",\"research_compact\":true}";
+        const string payload = "{\"type\":\"export_paint_texture\"}";
         var reply = await Runtime.SendPaintCommandAsync(payload, TimeSpan.FromSeconds(120), cancellationToken);
         if (!reply.Ok || !reply.Success)
         {
@@ -301,51 +300,21 @@ public sealed class HostSession
             {
                 return new PaintTextureExportResult(false, "The paint texture reply did not contain metadata.", "", "", "", "", 0);
             }
-            if (metadata.TryGetProperty("runtime_paint_component_inventory", out var inventory) &&
-                inventory.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var item in inventory.EnumerateArray())
-                {
-                    if (item.ValueKind != JsonValueKind.Object)
-                        continue;
-                    var written = item.TryGetProperty("albedo_dump_written", out var writtenElement) &&
-                                  writtenElement.ValueKind == JsonValueKind.True;
-                    if (!written)
-                        continue;
-                    var candidate = Text(item, "albedo_dump_path", "");
-                    if (string.IsNullOrWhiteSpace(candidate))
-                        continue;
-                    var matches = item.TryGetProperty("matches_resolved_component", out var matchElement) &&
-                                  matchElement.ValueKind == JsonValueKind.True;
-                    if (matches || string.IsNullOrWhiteSpace(albedoDump))
-                    {
-                        albedoDump = candidate;
-                        size = Int(item, "albedo_dump_texture_size", size);
-                        var candidatePbr = Text(item, "packed_pbr_dump_path", "");
-                        if (!string.IsNullOrWhiteSpace(candidatePbr))
-                            pbrDump = candidatePbr;
-                    }
-                    if (matches)
-                        break;
-                }
-            }
+            albedoDump = Text(metadata, "albedo_path", "");
+            pbrDump = Text(metadata, "pbr_path", "");
+            size = Int(metadata, "texture_size", 0);
         }
         catch (JsonException ex)
         {
             return new PaintTextureExportResult(false, "The paint texture reply was not valid JSON: " + ex.Message, "", "", "", "", 0);
         }
 
-        if (string.IsNullOrWhiteSpace(albedoDump) || size <= 0)
-            return new PaintTextureExportResult(false, "The game did not return a readable paint texture dump.", "", "", "", "", 0);
-        if (string.IsNullOrWhiteSpace(pbrDump))
+        if (string.IsNullOrWhiteSpace(albedoDump) ||
+            string.IsNullOrWhiteSpace(pbrDump) ||
+            size <= 0)
         {
-            var albedoName = Path.GetFileName(albedoDump);
-            var pbrName = albedoName.Replace(
-                "research-texture-albedo-",
-                "research-texture-packed-pbr-",
-                StringComparison.OrdinalIgnoreCase);
-            if (!string.Equals(albedoName, pbrName, StringComparison.OrdinalIgnoreCase))
-                pbrDump = Path.Combine(Path.GetDirectoryName(albedoDump) ?? "", pbrName);
+            return new PaintTextureExportResult(
+                false, "The game did not return a readable paint texture dump.", "", "", "", "", 0);
         }
 
         byte[] albedoBytes;
