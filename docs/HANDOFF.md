@@ -1,7 +1,8 @@
 # MecchaCamouflage 交接文档
 
 最后更新：2026-11-28  
-当前 HEAD：`9d5a4a7 fix(image): replay reused paint via image paint mesh samples`  
+当前功能 HEAD：`9d5a4a7 fix(image): replay reused paint via image paint mesh samples`  
+交接文档提交：`3805858 docs: add project handoff`  
 当前测试版：`v1.7.5-test.11`  
 稳定版：`v1.7.4`  
 当前工作区：干净（本文提交前）
@@ -124,7 +125,7 @@ git tag -a v1.7.5-test.N -m "v1.7.5-test.N"
 git push fork v1.7.5-test.N
 ```
 
-- CI：push 到 `main` 触发 `.github/workflows/ci.yml`。
+- CI：**手动触发**（Actions → CI → Run workflow，`workflow_dispatch`）；不再随每次 push 自动构建。
 - Release：push `v*-test*` tag 触发 `.github/workflows/release.yml`，生成 `meccha-camouflage-v<tag>.exe`。
 - 构建产物：`.build\bin\meccha-camouflage.exe`。
 - 发布页：`https://github.com/airesein/MecchaCamouflage/releases`
@@ -146,6 +147,7 @@ git push fork v1.7.5-test.N
 ## 10. 最近提交
 
 ```text
+3805858 docs: add project handoff
 9d5a4a7 fix(image): replay reused paint via image paint mesh samples
 fa24207 fix(image): never skip replay texels by previous color
 39df642 feat(image): rework reuse paint controls and replay speed
