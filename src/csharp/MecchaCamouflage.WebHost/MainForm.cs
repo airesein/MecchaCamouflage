@@ -1306,7 +1306,17 @@ public sealed class MainForm : Form
     {
         if (!TryReadPaintExportPath(payload, out var manifestPath, out var message))
             return new HostCommandResult(false, message, CommandResultLevel.Warn);
-        var result = await session.StartReusePaintAsync(manifestPath);
+        var strategy = payload.TryGetProperty("strategy", out var value) ? value.ToString() : "adaptive";
+        PaintReplayStrategy? selection = strategy switch
+        {
+            "adaptive" => PaintReplayStrategy.Adaptive,
+            "contour" => PaintReplayStrategy.Contour,
+            "dominant" => PaintReplayStrategy.Dominant,
+            _ => null
+        };
+        if (selection is null)
+            return new HostCommandResult(false, "The selected paint strategy is invalid.", CommandResultLevel.Warn);
+        var result = await session.StartReusePaintAsync(manifestPath, strategy: selection.Value);
         return new HostCommandResult(
             result.Success,
             result.Message,

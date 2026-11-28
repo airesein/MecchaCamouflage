@@ -24121,6 +24121,8 @@ namespace
         const auto pbr_path = json_string_field(request, "pbr_path", "");
         const auto body_type =
             lower_copy(json_string_field(request, "body_type", ""));
+        const auto requested_strategy = paint_texture_replay::strategy_from_name(
+            json_string_field(request, "replay_strategy", "adaptive"));
 
         std::string metadata = "\"route\":\"replay_paint_texture\"";
         metadata += ",\"replay_route\":\"mesh_surface_uv_texture_replay\"";
@@ -24461,14 +24463,33 @@ namespace
 
         const auto texture =
             paint_texture_replay::Texture{texture_size, albedo.bytes, packed_pbr.bytes};
-        const auto brush_radii = paint_texture_replay::plan_brush_radii(
-            texture, plan_samples, brush.Radius, max_radius_uv);
+        const auto replay_plan = paint_texture_replay::plan_replay(
+            texture, plan_samples, brush.Radius, max_radius_uv, requested_strategy);
 
         std::vector<sdk::FPaintStroke> strokes{};
-        strokes.reserve(plan_samples.size());
-        std::size_t merged_strokes = 0;
+        strokes.reserve(replay_plan.stroke_count());
         std::size_t detail_strokes = 0;
         float largest_radius = 0.0f;
+        const auto append_stroke = [&](const MeshFirstPlanSample& sample,
+                                       float stroke_radius,
+                                       const std::array<double, 6>& channels) {
+            auto stroke_brush = brush;
+            stroke_brush.Radius = stroke_radius;
+            detail_strokes += stroke_radius == brush.Radius;
+            largest_radius = std::max(largest_radius, stroke_radius);
+            const auto channel = sdk_make_channel(
+                channels[0], channels[1], channels[2],
+                channels[3], channels[4], channels[5],
+                sdk::EPaintChannelApplyMode::Override);
+            strokes.push_back(sdk_make_uv_stroke(
+                sample.u, sample.v, channel, stroke_brush,
+                sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
+        };
+        for (const auto& base : replay_plan.base_strokes)
+        {
+            append_stroke(plan_samples[base.sample_index], base.radius,
+                          paint_texture_replay::material_channels(base.material));
+        }
         for (std::size_t sample_index = 0;
              sample_index < plan_samples.size();
              ++sample_index)
@@ -24483,31 +24504,22 @@ namespace
             {
                 continue;
             }
-            const float stroke_radius = brush_radii[sample_index];
+            const float stroke_radius = replay_plan.radii[sample_index];
             if (stroke_radius == 0.0f)
             {
-                ++merged_strokes;
                 continue;
             }
-            auto stroke_brush = brush;
-            stroke_brush.Radius = stroke_radius;
-            detail_strokes += stroke_radius == brush.Radius;
-            largest_radius = std::max(largest_radius, stroke_radius);
             // Export and Preview use the game texture's raw channels and UVs.
-            const auto channels = texture.sample(sample.u, sample.v);
-            const auto channel = sdk_make_channel(
-                channels[0], channels[1], channels[2],
-                channels[3], channels[4], channels[5],
-                sdk::EPaintChannelApplyMode::Override);
-            strokes.push_back(sdk_make_uv_stroke(
-                sample.u,
-                sample.v,
-                channel,
-                stroke_brush,
-                sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
+            append_stroke(sample, stroke_radius, texture.sample(sample.u, sample.v));
         }
+        metadata += ",\"replay_strategy_requested\":\"" +
+                    std::string(paint_texture_replay::strategy_name(requested_strategy)) + "\"";
+        metadata += ",\"replay_strategy_used\":\"" +
+                    std::string(paint_texture_replay::strategy_name(replay_plan.strategy)) + "\"";
+        metadata += ",\"replay_base_strokes\":" + std::to_string(replay_plan.base_strokes.size());
         metadata += ",\"replay_strokes_total\":" + std::to_string(strokes.size());
-        metadata += ",\"replay_strokes_merged\":" + std::to_string(merged_strokes);
+        metadata += ",\"replay_strokes_merged\":" + std::to_string(
+            std::count(replay_plan.radii.begin(), replay_plan.radii.end(), 0.0f));
         metadata += ",\"replay_detail_strokes\":" + std::to_string(detail_strokes);
         metadata += ",\"replay_largest_brush_texels\":" +
                     std::to_string(largest_radius * active_texture_size);
@@ -24628,7 +24640,7 @@ namespace
         async_job->replay_front = 0;
         async_job->replay_side = 0;
         async_job->replay_back = 0;
-        async_job->replay_fill_end = 0;
+        async_job->replay_fill_end = replay_plan.base_strokes.size();
         const int local_sample_batch_limit =
             async_job->replication_pacing.calls_per_tick;
         async_job->local_render_target_write_budget =

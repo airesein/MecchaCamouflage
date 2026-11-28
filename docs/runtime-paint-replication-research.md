@@ -34,11 +34,19 @@ the 4-face image or the canonical atlas. Each mesh sample's UV indexes the saved
 raw albedo/PBR texture directly (no `v` flip) with edge-clamped bilinear
 sampling. Replay uses the raw albedo and PBR values also used by Preview and
 stamps them with a solid brush through `PaintAtUVWithBrush` on channel 7.
-The planner tries wide tiles first and subdivides around color and material
-changes. A wider stroke replaces fine strokes only when it covers their
-footprints and the surrounding albedo and PBR texels have identical values.
-The response reports `replay_strokes_merged`, `replay_detail_strokes`, and
-`replay_largest_brush_texels`.
+The Reuse Paint strategy buttons choose how Start plans the strokes.
+
+- Adaptive tries wide tiles first and subdivides around color and material changes.
+- Contour fits disks based on the distance to the nearest albedo or material edge.
+- Base + Detail paints a dominant color and material first, then replays the
+  remaining fine coverage. The base is constrained to its tile and sampled UV
+  island. A fine stroke is omitted only if the base covers its full footprint
+  and the saved texture is uniform around that sample.
+
+Both alternative strategies fall back to Adaptive when they do not save any
+strokes. The response and application log report the strategy used and base
+stroke count. The response also reports `replay_strokes_merged`,
+`replay_detail_strokes`, and `replay_largest_brush_texels`.
 
 Preview locally imports the archive and preserves the pre-preview material
 snapshot through the existing Preview/Unpreview mechanism. Stop Preview restores

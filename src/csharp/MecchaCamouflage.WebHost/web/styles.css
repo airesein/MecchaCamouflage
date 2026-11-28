@@ -907,6 +907,10 @@ body.editing #image-fill-section.disabled .field-label {
   padding: 8px 0 0;
 }
 
+.reuse-paint-strategies {
+  grid-column: 1 / -1;
+}
+
 .danger-action:not(:disabled) {
   border-color: color-mix(in srgb, var(--error) 72%, var(--hairline));
   color: #ffabab;

@@ -145,6 +145,104 @@ int main()
             }
         }
     }
+    {
+        using namespace paint_texture_replay;
+        constexpr int size = 256;
+        constexpr float detail_radius = 2.5f / size;
+        constexpr double max_radius = 40.0 / size;
+        std::vector<std::uint8_t> albedo(size * size * 4, 128);
+        std::vector<std::uint8_t> pbr(size * size * 4, 64);
+        const Texture texture{size, albedo, pbr};
+        struct Sample { double u; double v; int uv_island; };
+        std::vector<Sample> samples;
+        for (int y = 6; y < size - 6; y += 2)
+        {
+            for (int x = 6; x < size - 6; x += 2)
+            {
+                samples.push_back({double(x) / (size - 1), double(y) / (size - 1), 0});
+            }
+        }
+        // The diagonal stripe differs only in roughness, so color-only merging
+        // would miss it. The base plan should repaint it in a later stroke.
+        for (int y = 0; y < size; ++y)
+        {
+            for (int x = std::max(0, y - 3); x <= std::min(size - 1, y + 3); ++x)
+            {
+                pbr[texture.offset(x, y) + 1] = 110;
+            }
+        }
+        const auto adaptive = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Adaptive);
+        const auto contour = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Contour);
+        const auto dominant = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Dominant);
+        if (contour.strategy != Strategy::Contour || contour.stroke_count() >= adaptive.stroke_count() ||
+            dominant.strategy != Strategy::Dominant || dominant.stroke_count() >= adaptive.stroke_count() ||
+            dominant.base_strokes.empty() || contour.base_strokes.size() != 0)
+        {
+            return 188;
+        }
+
+        const auto rasterize = [&](const ReplayPlan& plan) {
+            constexpr auto unpainted = std::numeric_limits<std::uint64_t>::max();
+            std::vector<std::uint64_t> pixels(size * size, unpainted);
+            const auto stamp = [&](std::size_t index, float radius, std::uint64_t material) {
+                const double u = samples[index].u * (size - 1);
+                const double v = samples[index].v * (size - 1);
+                const double extent = radius * (size - 1);
+                for (int y = std::max(0, static_cast<int>(std::ceil(v - extent)));
+                     y <= std::min(size - 1, static_cast<int>(std::floor(v + extent))); ++y)
+                {
+                    for (int x = std::max(0, static_cast<int>(std::ceil(u - extent)));
+                         x <= std::min(size - 1, static_cast<int>(std::floor(u + extent))); ++x)
+                    {
+                        if ((x - u) * (x - u) + (y - v) * (y - v) <= extent * extent)
+                        {
+                            pixels[texture.offset(x, y) / 4] = material;
+                        }
+                    }
+                }
+            };
+            for (const auto& base : plan.base_strokes)
+            {
+                stamp(base.sample_index, base.radius, base.material);
+            }
+            for (std::size_t i = 0; i < samples.size(); ++i)
+            {
+                if (plan.radii[i] == 0.0f) continue;
+                stamp(i, plan.radii[i], texture.material_key(
+                    texture.nearest_texel(samples[i].u, samples[i].v)));
+            }
+            return pixels;
+        };
+        const auto baseline_pixels = rasterize(adaptive);
+        const auto contour_pixels = rasterize(contour);
+        const auto dominant_pixels = rasterize(dominant);
+        for (const auto& sample : samples)
+        {
+            const auto pixel = texture.nearest_texel(sample.u, sample.v);
+            if (baseline_pixels[pixel] == std::numeric_limits<std::uint64_t>::max() ||
+                contour_pixels[pixel] != baseline_pixels[pixel] ||
+                dominant_pixels[pixel] != baseline_pixels[pixel])
+            {
+                return 189;
+            }
+        }
+        for (std::size_t i = 0; i < samples.size(); ++i)
+        {
+            samples[i].uv_island = static_cast<int>(i % 2);
+        }
+        const auto split_islands = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Dominant);
+        if (split_islands.strategy != Strategy::Adaptive || !split_islands.base_strokes.empty())
+        {
+            return 190;
+        }
+        const auto channels = material_channels(texture.material_key(texture.nearest_texel(0.5, 0.5)));
+        if (std::abs(channels[0] - 128.0 / 255.0) > 0.000001 ||
+            std::abs(channels[4] - 110.0 / 255.0) > 0.000001 ||
+            strategy_from_name("unknown") != Strategy::Adaptive)
+        {
+            return 191;
+        }
+    }
     BridgeStartBlockV2 bootstrap{};
     bootstrap.magic = BridgeStartMagicV2;
     bootstrap.size = sizeof(bootstrap);

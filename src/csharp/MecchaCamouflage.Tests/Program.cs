@@ -3388,13 +3388,18 @@ static void WebUiEnablesReusePaintFromPathInput()
         "Start and Preview must enable from non-empty path input text");
     Assert(app.Contains("activePaintKind !== \"reuse\"", StringComparison.Ordinal) &&
            app.Contains("activePreviewKind !== \"reuse\"", StringComparison.Ordinal) &&
-           app.Contains("send(\"reusePaintStart\", { manifestPath }", StringComparison.Ordinal) &&
+           app.Contains("send(\"reusePaintStart\", { manifestPath, strategy: reusePaintStrategy }", StringComparison.Ordinal) &&
            app.Contains("send(\"reusePaintPreview\", { manifestPath }", StringComparison.Ordinal) &&
            app.Contains("send(\"reusePaintStop\"", StringComparison.Ordinal) &&
            app.Contains("send(\"reusePaintStopPreview\"", StringComparison.Ordinal),
         "Stop and Stop Preview must follow the active Reuse Paint state and send the matching commands");
     Assert(!app.Contains("byId(\"image-reuse-paint\")", StringComparison.Ordinal),
         "the old single Reuse Paint action must be removed");
+    Assert(markup.Contains("data-reuse-paint-strategy=\"adaptive\" aria-pressed=\"true\"", StringComparison.Ordinal) &&
+           markup.Contains("data-reuse-paint-strategy=\"contour\"", StringComparison.Ordinal) &&
+           markup.Contains("data-reuse-paint-strategy=\"dominant\"", StringComparison.Ordinal) &&
+           app.Contains("button.setAttribute(\"aria-pressed\", String(selected))", StringComparison.Ordinal),
+        "Reuse Paint must offer all three strategies and expose the selected button");
 }
 
 static void RuntimeSnapshotReportsManualPaintState()
@@ -5891,13 +5896,17 @@ static void ReusePaintRequestsDirectUvReplay()
         "the local import payload must request native preview snapshot preservation");
 
     var replayEnd = host.IndexOf(
-        "private static (int TextureSize, int StrokeCount) ParseReplayMetadata",
+        "ParseReplayMetadata(string raw)",
         replayStart,
         StringComparison.Ordinal);
     Assert(replayEnd > replayStart, "replay method boundary must remain discoverable");
     var replay = host[replayStart..replayEnd];
     Assert(replay.Contains("[\"type\"] = \"replay_paint_texture\"", StringComparison.Ordinal),
         "Reuse Paint must send replay_paint_texture");
+    Assert(replay.Contains("[\"replay_strategy\"] = strategyName", StringComparison.Ordinal) &&
+           replay.Contains("PaintReplayStrategy.Contour => \"contour\"", StringComparison.Ordinal) &&
+           replay.Contains("PaintReplayStrategy.Dominant => \"dominant\"", StringComparison.Ordinal),
+        "Reuse Paint must send the strategy selected by the user");
     Assert(replay.Contains("[\"albedo_path\"]", StringComparison.Ordinal) &&
            replay.Contains("[\"pbr_path\"]", StringComparison.Ordinal),
         "direct replay must send the extracted raw albedo and PBR paths");
@@ -5909,7 +5918,7 @@ static void ReusePaintRequestsDirectUvReplay()
     Assert(!replay.Contains("import_paint_texture", StringComparison.Ordinal),
         "replay must not use local import as its transport");
 
-    Assert(form.Contains("session.StartReusePaintAsync(manifestPath)", StringComparison.Ordinal) &&
+    Assert(form.Contains("session.StartReusePaintAsync(manifestPath, strategy: selection.Value)", StringComparison.Ordinal) &&
            form.Contains("session.PreviewPaintTextureAsync(manifestPath)", StringComparison.Ordinal) &&
            form.Contains("session.StopReusePaintPreviewAsync()", StringComparison.Ordinal) &&
            form.Contains("session.StopPaintAsync()", StringComparison.Ordinal),
@@ -5997,8 +6006,12 @@ static void NativeReplaySamplesMeshSurfacePlan()
     Assert(body.Contains("sdk::FRuntimeBrushSettings brush{}", StringComparison.Ordinal) &&
            !body.Contains("RuntimePaintable_CurrentBrushSettings", StringComparison.Ordinal),
         "replay must use a solid brush so an active brush texture cannot alter the saved color");
-    Assert(body.Contains("paint_texture_replay::plan_brush_radii", StringComparison.Ordinal),
-        "replay must use coverage-checked brush radii for uniform texture areas");
+    var basePass = body.IndexOf("for (const auto& base : replay_plan.base_strokes)", StringComparison.Ordinal);
+    var detailPass = body.IndexOf("const float stroke_radius = replay_plan.radii[sample_index]", StringComparison.Ordinal);
+    Assert(body.Contains("paint_texture_replay::plan_replay", StringComparison.Ordinal) &&
+           body.Contains("json_string_field(request, \"replay_strategy\", \"adaptive\")", StringComparison.Ordinal) &&
+           basePass >= 0 && detailPass > basePass,
+        "replay must plan the chosen strategy and queue the base strokes ahead of the details");
     Assert(body.Contains("sdk_make_uv_stroke(", StringComparison.Ordinal) &&
            body.Contains("sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive", StringComparison.Ordinal),
         "replay must build channel-7 UV strokes");
