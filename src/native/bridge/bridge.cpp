@@ -24311,16 +24311,6 @@ namespace
         const int grid_width = (texture_size + step_texels - 1) / step_texels;
         strokes.reserve(static_cast<std::size_t>(grid_width) *
                         static_cast<std::size_t>(grid_width));
-        const bool compression_enabled = color_compression_tolerance > 0.0;
-        const double compression_threshold = color_compression_tolerance / 100.0;
-        int color_compression_skipped = 0;
-        bool has_previous_stroke_color = false;
-        double previous_r = 0.0;
-        double previous_g = 0.0;
-        double previous_b = 0.0;
-        double previous_metallic = 0.0;
-        double previous_roughness = 0.0;
-        double previous_emissive = 0.0;
         for (int y = 0; y < texture_size; y += step_texels)
         {
             const double v =
@@ -24346,20 +24336,6 @@ namespace
                     static_cast<double>(packed_pbr.bytes[offset + 1U]) / 255.0;
                 const double emissive =
                     static_cast<double>(packed_pbr.bytes[offset + 2U]) / 255.0;
-                const bool within_previous_color =
-                    compression_enabled && has_previous_stroke_color &&
-                    std::max({std::abs(r - previous_r),
-                              std::abs(g - previous_g),
-                              std::abs(b - previous_b),
-                              std::abs(metallic - previous_metallic),
-                              std::abs(roughness - previous_roughness),
-                              std::abs(emissive - previous_emissive)}) <=
-                        compression_threshold;
-                if (within_previous_color)
-                {
-                    ++color_compression_skipped;
-                    continue;
-                }
                 const auto channel = sdk_make_channel(
                     runtime_contract::appearance_srgb_to_linear(r),
                     runtime_contract::appearance_srgb_to_linear(g),
@@ -24374,20 +24350,9 @@ namespace
                     channel,
                     brush,
                     sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
-                previous_r = r;
-                previous_g = g;
-                previous_b = b;
-                previous_metallic = metallic;
-                previous_roughness = roughness;
-                previous_emissive = emissive;
-                has_previous_stroke_color = true;
             }
         }
         metadata += ",\"replay_strokes_total\":" + std::to_string(strokes.size());
-        metadata += ",\"replay_color_compression_enabled\":" +
-                    std::string(json_bool(compression_enabled));
-        metadata += ",\"replay_color_compression_skipped\":" +
-                    std::to_string(color_compression_skipped);
         metadata += ",\"replay_alpha_skipping\":false";
         metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
         metadata += ",\"local_route_mode\":\"native_recorded_paint\"";

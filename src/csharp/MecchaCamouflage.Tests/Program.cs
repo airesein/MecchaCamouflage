@@ -5966,11 +5966,9 @@ static void NativeReplaySamplesUvTextureDirectly()
     Assert(body.Contains("image_paint_brush_size_texels", StringComparison.Ordinal) &&
            body.Contains("default_step_texels = std::max(1, brush_size_texels / 2)", StringComparison.Ordinal),
         "replay must follow the Image brush size and derive the default grid step from it");
-    Assert(body.Contains("color_compression_tolerance", StringComparison.Ordinal) &&
-           body.Contains("image_paint_color_compression_tolerance", StringComparison.Ordinal) &&
-           body.Contains("within_previous_color", StringComparison.Ordinal) &&
-           body.Contains("compression_threshold", StringComparison.Ordinal),
-        "replay must skip only texels within the Image color-compression tolerance of the previous stroke");
+    Assert(!body.Contains("within_previous_color", StringComparison.Ordinal) &&
+           !body.Contains("compression_threshold", StringComparison.Ordinal),
+        "replay must not skip texels based on the previous stroke color (that leaves blank regions)");
     Assert(!body.Contains("albedo.bytes[offset + 3U]", StringComparison.Ordinal) &&
            body.Contains("replay_alpha_skipping", StringComparison.Ordinal),
         "replay must not drop texels based on the paint texture alpha");
