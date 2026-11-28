@@ -856,8 +856,7 @@ public sealed class HostSession
 
     public async Task<PaintTextureReuseResult> StartReusePaintAsync(
         string manifestPath,
-        CancellationToken cancellationToken = default,
-        PaintReplayStrategy strategy = PaintReplayStrategy.Adaptive)
+        CancellationToken cancellationToken = default)
     {
         var source = TryPreparePaintTextureSource(manifestPath, out var message);
         if (source is null)
@@ -867,77 +866,80 @@ public sealed class HostSession
         }
         try
         {
-            if (!string.IsNullOrWhiteSpace(source.StrokesPath) && source.StrokeCount > 0)
+            if (string.IsNullOrWhiteSpace(source.StrokesPath) || source.StrokeCount <= 0)
             {
-                var exact = await ReplayRecordedStrokesAsync(
-                    source.StrokesPath,
-                    source.StrokeCount,
-                    source.StrokeSource,
-                    cancellationToken);
-                if (!exact.Success)
-                {
-                    Log.Warn("Reuse Paint failed: " +
-                             (string.IsNullOrWhiteSpace(exact.Message) ? "unknown error" : exact.Message));
-                    return new PaintTextureReuseResult(
-                        false,
-                        exact.Message,
-                        exact.Stage,
-                        false,
-                        false,
-                        exact.TextureSize,
-                        exact.StrokeCount,
-                        true);
-                }
+                const string noStrokes =
+                    "This .mcpaint archive has no recorded brush strokes. " +
+                    "Use Preview to view its saved texture, or export it again after painting with Record active.";
+                Log.Warn("Reuse Paint failed: " + noStrokes);
                 return new PaintTextureReuseResult(
-                    true,
+                    false,
+                    noStrokes,
+                    "archive_has_no_strokes",
+                    false,
+                    false,
+                    source.TextureSize,
+                    0,
+                    false);
+            }
+            var exact = await ReplayRecordedStrokesAsync(
+                source.StrokesPath,
+                source.StrokeCount,
+                source.StrokeSource,
+                cancellationToken);
+            if (!exact.Success)
+            {
+                Log.Warn("Reuse Paint failed: " +
+                         (string.IsNullOrWhiteSpace(exact.Message) ? "unknown error" : exact.Message));
+                return new PaintTextureReuseResult(
+                    false,
                     exact.Message,
                     exact.Stage,
                     false,
-                    true,
+                    false,
                     exact.TextureSize,
                     exact.StrokeCount,
                     true);
             }
-
-            double brushSizeTexels;
-            double colorCompressionTolerance;
-            lock (paintStateGate)
-            {
-                brushSizeTexels = Settings.Image.BrushSizeTexels;
-                colorCompressionTolerance = Settings.Image.ColorCompressionTolerance;
-            }
-            var stepTexels = Math.Max(1, (int)(brushSizeTexels / 2.0));
-            var replay = await ReplayPaintTextureAsync(
-                brushSizeTexels,
-                stepTexels,
-                source.TextureSize,
-                null,
-                source.AlbedoPath,
-                source.PbrPath,
-                colorCompressionTolerance,
-                cancellationToken,
-                strategy);
-            if (!replay.Success)
-            {
-                Log.Warn("Reuse Paint failed: " +
-                         (string.IsNullOrWhiteSpace(replay.Message) ? "unknown error" : replay.Message));
-                return new PaintTextureReuseResult(
-                    false,
-                    replay.Message,
-                    replay.Stage,
-                    false,
-                    false,
-                    replay.TextureSize,
-                    replay.StrokeCount);
-            }
             return new PaintTextureReuseResult(
                 true,
-                replay.Message,
-                replay.Stage,
+                exact.Message,
+                exact.Stage,
                 false,
                 true,
-                replay.TextureSize,
-                replay.StrokeCount);
+                exact.TextureSize,
+                exact.StrokeCount,
+                true);
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(source.TempDirectory))
+                TryDeleteDirectory(source.TempDirectory);
+        }
+    }
+
+    /// <summary>
+    /// Reads a saved archive without applying it anywhere. The returned status
+    /// lets the UI show whether Reuse Paint can run (recorded strokes present)
+    /// or whether only the exact texture Preview is available.
+    /// </summary>
+    public Task<PaintTextureInspectResult> InspectPaintExportAsync(
+        string manifestPath,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var source = TryPreparePaintTextureSource(manifestPath, out var message);
+        if (source is null)
+            return Task.FromResult(new PaintTextureInspectResult(false, message));
+        try
+        {
+            return Task.FromResult(new PaintTextureInspectResult(
+                true,
+                "",
+                source.TextureSize,
+                source.StrokeCount,
+                source.StrokeSource,
+                source.StrokeCount > 0));
         }
         finally
         {
@@ -1042,7 +1044,7 @@ public sealed class HostSession
             Log.Info($"Reuse Paint: replaying {expectedStrokeCount} recorded strokes exactly.");
             var response = await Runtime.SendPaintAsync(payload, cancellationToken);
             var message = FriendlyBridgeMessage(response.Message.Length > 0 ? response.Message : response.Stage);
-            var (replyTextureSize, strokeCount, usedStrategy, baseStrokes) = ParseReplayMetadata(response.Raw);
+            var (replyTextureSize, strokeCount) = ParseReplayMetadata(response.Raw);
             if (response.Success)
             {
                 lock (paintStateGate)
@@ -1051,8 +1053,6 @@ public sealed class HostSession
                         nativePaintMayBeRunning = false;
                 }
                 LogFinalProgressOnce();
-                if (!string.IsNullOrEmpty(usedStrategy))
-                    Log.Info($"Reuse Paint exact replay | used={usedStrategy} | recorded strokes={baseStrokes}");
                 var completed = strokeCount > 0
                     ? $"Reuse Paint: replayed {strokeCount} recorded strokes exactly | size={replyTextureSize}"
                     : "Reuse Paint: recorded strokes replayed.";
@@ -1119,187 +1119,25 @@ public sealed class HostSession
         }
     }
 
-    public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync(
-        double? brushSizeTexels = null,
-        int? stepTexels = null,
-        int? textureSize = null,
-        string? bodyType = null,
-        string? albedoPath = null,
-        string? pbrPath = null,
-        double? colorCompressionTolerance = null,
-        CancellationToken cancellationToken = default,
-        PaintReplayStrategy strategy = PaintReplayStrategy.Adaptive)
-    {
-        int runGeneration;
-        lock (paintStateGate)
-        {
-            if (PaintRunning || nativePaintMayBeRunning)
-            {
-                const string message = "Stop the active paint before replaying a paint export.";
-                Log.Warn("Paint replay failed: " + message);
-                return new PaintTextureReplayResult(false, message, "paint_running");
-            }
-            PaintRunning = true;
-            activePaintKind = PaintKind.Reuse;
-            runGeneration = ++nextPaintGeneration;
-            activePaintGeneration = runGeneration;
-            cancelState = PaintCancelState.None;
-            cancelPaintGeneration = 0;
-            paintRequestDispatchGeneration = 0;
-        }
-        currentPaintStartedAt = DateTimeOffset.UtcNow;
-        currentProgressIsServerPaint = true;
-        finalProgressLogged = false;
-        ResetReplayPassLog();
-        TryDeleteProgressSnapshot();
-        try
-        {
-            using var process = Runtime.FindGameProcess(Settings.GameProcessName);
-            if (process is null)
-            {
-                const string failureMessage = "Game process not found.";
-                Log.Warn(failureMessage);
-                return new PaintTextureReplayResult(false, failureMessage, "process_missing");
-            }
-            if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
-            {
-                const string failureMessage = "Bridge is not connected.";
-                Log.Warn(failureMessage);
-                return new PaintTextureReplayResult(false, failureMessage, "bridge_missing");
-            }
-            if (!TryBeginPaintDispatch(runGeneration))
-            {
-                const string failureMessage = "Paint: canceled.";
-                Log.Info(failureMessage);
-                return new PaintTextureReplayResult(false, failureMessage, "cancelled");
-            }
-
-            var strategyName = strategy switch
-            {
-                PaintReplayStrategy.Contour => "contour",
-                PaintReplayStrategy.Dominant => "dominant",
-                _ => "adaptive"
-            };
-            var payload = new Dictionary<string, object>
-            {
-                ["type"] = "replay_paint_texture",
-                ["replay_strategy"] = strategyName
-            };
-            if (brushSizeTexels is not null)
-                payload["brush_size_texels"] = brushSizeTexels.Value;
-            if (stepTexels is not null)
-                payload["step_texels"] = stepTexels.Value;
-            if (textureSize is not null)
-                payload["texture_size"] = textureSize.Value;
-            if (!string.IsNullOrWhiteSpace(bodyType))
-                payload["body_type"] = bodyType.Trim();
-            if (!string.IsNullOrWhiteSpace(albedoPath))
-                payload["albedo_path"] = albedoPath;
-            if (!string.IsNullOrWhiteSpace(pbrPath))
-                payload["pbr_path"] = pbrPath;
-            if (colorCompressionTolerance is not null)
-                payload["color_compression_tolerance"] = colorCompressionTolerance.Value;
-
-            Log.Info("Reuse Paint: painting the saved texture onto the body. This may take a while.");
-            var response = await Runtime.SendPaintAsync(
-                JsonSerializer.Serialize(payload),
-                cancellationToken);
-            var message = FriendlyBridgeMessage(response.Message.Length > 0 ? response.Message : response.Stage);
-            var (replyTextureSize, strokeCount, usedStrategy, baseStrokes) = ParseReplayMetadata(response.Raw);
-            if (response.Success)
-            {
-                lock (paintStateGate)
-                {
-                    if (activePaintGeneration == runGeneration)
-                        nativePaintMayBeRunning = false;
-                }
-                LogFinalProgressOnce();
-                if (!string.IsNullOrEmpty(usedStrategy))
-                    Log.Info($"Reuse Paint strategy | requested={strategyName} | used={usedStrategy} | base strokes={baseStrokes}");
-                var completed = strokeCount > 0
-                    ? $"Reuse Paint: painted {strokeCount} UV strokes onto the body | size={replyTextureSize}"
-                    : "Reuse Paint: saved texture painted onto the body.";
-                Log.Info(completed);
-                return new PaintTextureReplayResult(
-                    true,
-                    completed,
-                    response.Stage,
-                    replyTextureSize,
-                    strokeCount);
-            }
-            if (IsPaintCancellationMessage(message))
-            {
-                lock (paintStateGate)
-                {
-                    if (activePaintGeneration == runGeneration)
-                        nativePaintMayBeRunning = false;
-                }
-                LogFinalProgressOnce();
-                Log.Info(message);
-                return new PaintTextureReplayResult(
-                    false,
-                    message,
-                    response.Stage,
-                    replyTextureSize,
-                    strokeCount);
-            }
-            lock (paintStateGate)
-            {
-                if (activePaintGeneration == runGeneration)
-                    nativePaintMayBeRunning = false;
-            }
-            LogFailureProgressOnce();
-            Log.Error(message);
-            var failureDetail = PaintFailureDetail(response);
-            if (failureDetail is not null)
-                Log.Warn("Paint replay detail: " + failureDetail);
-            return new PaintTextureReplayResult(
-                false,
-                message,
-                response.Stage,
-                replyTextureSize,
-                strokeCount);
-        }
-        finally
-        {
-            lock (paintStateGate)
-            {
-                if (activePaintGeneration == runGeneration)
-                {
-                    PaintRunning = false;
-                    nativePaintMayBeRunning = false;
-                    activePaintKind = null;
-                    activePaintGeneration = 0;
-                    cancelState = PaintCancelState.None;
-                    cancelPaintGeneration = 0;
-                    paintRequestDispatchGeneration = 0;
-                }
-            }
-            currentProgressIsServerPaint = false;
-        }
-    }
-
-    private static (int TextureSize, int StrokeCount, string UsedStrategy, int BaseStrokes) ParseReplayMetadata(string raw)
+    private static (int TextureSize, int StrokeCount) ParseReplayMetadata(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
-            return (0, 0, "", 0);
+            return (0, 0);
         try
         {
             using var document = JsonDocument.Parse(raw);
             if (!document.RootElement.TryGetProperty("metadata", out var metadata) ||
                 metadata.ValueKind != JsonValueKind.Object)
             {
-                return (0, 0, "", 0);
+                return (0, 0);
             }
             return (
                 Int(metadata, "texture_size", 0),
-                Int(metadata, "replay_strokes_total", 0),
-                Text(metadata, "replay_strategy_used", ""),
-                Int(metadata, "replay_base_strokes", 0));
+                Int(metadata, "replay_strokes_total", 0));
         }
         catch
         {
-            return (0, 0, "", 0);
+            return (0, 0);
         }
     }
 

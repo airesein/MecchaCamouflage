@@ -34,6 +34,8 @@ stroke list. The typical flow is:
 6. Later, select that archive and press **Reuse Paint → Start**. The host sends
    the recorded strokes to the game, which applies them through
    `PaintAtUVWithBrush`.
+7. The status line under the path shows the recorded-stroke count for the
+   selected archive, so an archive can be checked before applying anything.
 
 ## `.mcpaint` compatibility
 
@@ -45,13 +47,13 @@ A stroke-aware archive contains:
 - `pbr.rgba` / `pbr.png`
 - `strokes.json` (raw recorded stroke list)
 
-Older `.mcpaint` files have only the texture. They remain valid: Reuse Paint
-detects that no stroke file is present and uses the existing texture replay
-strategies (Adaptive, Contour, Base + Detail). Apply Exact / Preview also keep
-using the exported texture.
-
-Exact 1:1 reproduction requires recorded strokes. A texture-only archive can
-only approximate the original brush path through the texture replay sampler.
+Reuse Paint uses recorded strokes only. There is no Adaptive/Contour/Base +
+Detail strategy selector. Older `.mcpaint` files with no `strokes.json` remain
+valid for **Preview**, which imports the exported albedo/PBR texture locally
+and restores the previous snapshot when preview is stopped. Pressing **Start**
+on a texture-only archive shows a clear message directing the user to Preview
+or to export again after recording strokes. Nothing is applied to other
+players by Preview.
 
 ## Native implementation and lifecycle
 
@@ -65,10 +67,12 @@ themselves.
 At **Record** time the bridge resolves the local `RuntimePaintableComponent` and
 its `PaintAtUVWithBrush` UFunction and installs its existing ProcessEvent detour
 on that component's vtable (the same safe detour mechanism used by the native
-Present/paint paths). The hook appends only calls whose receiver is the local
-component and whose UFunction is the resolved `PaintAtUVWithBrush`. The detour
-always forwards the original event; it does not break normal paint or hook
-chaining.
+Present/paint paths). Each patched vtable slot retains its own verified original,
+so UE builds that expose more than one ProcessEvent entry point no longer reject
+a recording hook as an "original mismatch". The hook appends only calls whose
+receiver is the local component and whose UFunction is the resolved
+`PaintAtUVWithBrush`. The detour always forwards the original event; it does not
+break normal paint, ESP, or other hook chaining.
 
 The recorded vector is a process-lifetime full history for the current
 recording take. **Record** starts a fresh take, **Stop Recording** freezes it,
@@ -102,5 +106,5 @@ reports `stroke_count`, `stroke_source`, and `strokes_written` in its metadata.
   them by path when possible and otherwise falls back to the currently selected
   in-game brush tip.
 - The archive's `strokes.json` uses a versioned schema
-  (`meccha_paint_strokes_v1`). Unknown schemas are rejected and fall back to
-  texture replay through the host.
+  (`meccha_paint_strokes_v1`). Unknown or missing stroke files are not replayed;
+  the archive remains usable through the exact texture **Preview**.

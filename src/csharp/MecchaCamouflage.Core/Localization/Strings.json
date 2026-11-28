@@ -1,10 +1,6 @@
 {
   "en": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Paint strategy",
-    "reuse.strategy.adaptive": "Adaptive",
-    "reuse.strategy.contour": "Contour",
-    "reuse.strategy.dominant": "Base + Detail",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -188,14 +184,13 @@
     "button.retry.once": "Retry once",
     "dialog.preset.load.title": "Load MecchaCamouflage Preset",
     "dialog.preset.save.title": "Save MecchaCamouflage Preset",
-    "dialog.preset.filter": "MecchaCamouflage Preset (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage Preset (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Reading archive...",
+    "archive.status.strokes": "{0} recorded strokes | {1}px texture",
+    "archive.status.textureOnly": "No recorded strokes | {1}px texture-only archive; use Preview"
   },
   "ja": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "描画方式",
-    "reuse.strategy.adaptive": "自動調整",
-    "reuse.strategy.contour": "輪郭塗り",
-    "reuse.strategy.dominant": "下塗り＋仕上げ",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -379,14 +374,13 @@
     "button.retry.once": "1回再試行",
     "dialog.preset.load.title": "MecchaCamouflage プリセットを読み込む",
     "dialog.preset.save.title": "MecchaCamouflage プリセットを保存",
-    "dialog.preset.filter": "MecchaCamouflage プリセット (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage プリセット (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "アーカイブを読み込み中...",
+    "archive.status.strokes": "記録済みストローク {0} 件 | テクスチャ {1}px",
+    "archive.status.textureOnly": "記録済みストロークなし | {1}px のテクスチャのみのアーカイブです。プレビューを使用してください"
   },
   "ko": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "칠하기 방식",
-    "reuse.strategy.adaptive": "적응형",
-    "reuse.strategy.contour": "윤곽 칠하기",
-    "reuse.strategy.dominant": "밑칠과 디테일",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -570,14 +564,13 @@
     "button.retry.once": "한 번 재시도",
     "dialog.preset.load.title": "MecchaCamouflage 프리셋 불러오기",
     "dialog.preset.save.title": "MecchaCamouflage 프리셋 저장",
-    "dialog.preset.filter": "MecchaCamouflage 프리셋 (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage 프리셋 (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "아카이브 읽는 중...",
+    "archive.status.strokes": "기록된 스트로크 {0}개 | 텍스처 {1}px",
+    "archive.status.textureOnly": "기록된 스트로크 없음 | {1}px 텍스처 전용 아카이브입니다. 미리보기를 사용하세요"
   },
   "es": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Método de pintado",
-    "reuse.strategy.adaptive": "Adaptativo",
-    "reuse.strategy.contour": "Contorno",
-    "reuse.strategy.dominant": "Base y detalle",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -761,14 +754,13 @@
     "button.retry.once": "Reintentar una vez",
     "dialog.preset.load.title": "Cargar preajuste de MecchaCamouflage",
     "dialog.preset.save.title": "Guardar preajuste de MecchaCamouflage",
-    "dialog.preset.filter": "Preajuste de MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Preajuste de MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Leyendo archivo...",
+    "archive.status.strokes": "{0} trazos grabados | textura de {1}px",
+    "archive.status.textureOnly": "Sin trazos grabados | archivo solo de textura de {1}px; usa Vista previa"
   },
   "fr": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Méthode de peinture",
-    "reuse.strategy.adaptive": "Adaptatif",
-    "reuse.strategy.contour": "Contours",
-    "reuse.strategy.dominant": "Fond et détails",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -952,14 +944,13 @@
     "button.retry.once": "Réessayer une fois",
     "dialog.preset.load.title": "Charger le préréglage MecchaCamouflage",
     "dialog.preset.save.title": "Enregistrer le préréglage MecchaCamouflage",
-    "dialog.preset.filter": "Préréglage MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Préréglage MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Lecture de l’archive...",
+    "archive.status.strokes": "{0} traits enregistrés | texture {1}px",
+    "archive.status.textureOnly": "Aucun trait enregistré | archive de texture {1}px uniquement ; utilisez Aperçu"
   },
   "de": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Malverfahren",
-    "reuse.strategy.adaptive": "Adaptiv",
-    "reuse.strategy.contour": "Konturen",
-    "reuse.strategy.dominant": "Grundfarbe + Details",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -1143,14 +1134,13 @@
     "button.retry.once": "Einmal wiederholen",
     "dialog.preset.load.title": "MecchaCamouflage-Voreinstellung laden",
     "dialog.preset.save.title": "MecchaCamouflage-Voreinstellung speichern",
-    "dialog.preset.filter": "MecchaCamouflage-Voreinstellung (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage-Voreinstellung (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Archiv wird gelesen...",
+    "archive.status.strokes": "{0} aufgezeichnete Striche | {1}px Textur",
+    "archive.status.textureOnly": "Keine aufgezeichneten Striche | {1}px reines Texturarchiv; nutze Vorschau"
   },
   "pt-BR": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Método de pintura",
-    "reuse.strategy.adaptive": "Adaptativo",
-    "reuse.strategy.contour": "Contorno",
-    "reuse.strategy.dominant": "Base e detalhes",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -1334,14 +1324,13 @@
     "button.retry.once": "Tentar novamente uma vez",
     "dialog.preset.load.title": "Carregar predefinição do MecchaCamouflage",
     "dialog.preset.save.title": "Salvar predefinição do MecchaCamouflage",
-    "dialog.preset.filter": "Predefinição do MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Predefinição do MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Lendo arquivo...",
+    "archive.status.strokes": "{0} traços gravados | textura de {1}px",
+    "archive.status.textureOnly": "Nenhum traço gravado | arquivo somente de textura de {1}px; use Pré-visualizar"
   },
   "zh-Hans": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "绘画方案",
-    "reuse.strategy.adaptive": "自适应",
-    "reuse.strategy.contour": "轮廓铺色",
-    "reuse.strategy.dominant": "主色打底",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -1525,14 +1514,13 @@
     "button.retry.once": "重试一次",
     "dialog.preset.load.title": "加载 MecchaCamouflage 预设",
     "dialog.preset.save.title": "保存 MecchaCamouflage 预设",
-    "dialog.preset.filter": "MecchaCamouflage 预设 (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage 预设 (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "正在读取存档...",
+    "archive.status.strokes": "已记录笔触 {0} 个 | 纹理 {1}px",
+    "archive.status.textureOnly": "没有已记录笔触 | {1}px 纯纹理存档；请使用预览"
   },
   "zh-Hant": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "繪畫方案",
-    "reuse.strategy.adaptive": "自適應",
-    "reuse.strategy.contour": "輪廓鋪色",
-    "reuse.strategy.dominant": "主色打底",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -1716,14 +1704,13 @@
     "button.retry.once": "重試一次",
     "dialog.preset.load.title": "載入 MecchaCamouflage 預設",
     "dialog.preset.save.title": "儲存 MecchaCamouflage 預設",
-    "dialog.preset.filter": "MecchaCamouflage 預設 (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage 預設 (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "正在讀取存檔...",
+    "archive.status.strokes": "已記錄筆觸 {0} 個 | 紋理 {1}px",
+    "archive.status.textureOnly": "沒有已記錄筆觸 | {1}px 純紋理存檔；請使用預覽"
   },
   "ru": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Способ окраски",
-    "reuse.strategy.adaptive": "Адаптивный",
-    "reuse.strategy.contour": "По контуру",
-    "reuse.strategy.dominant": "Основа и детали",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -1907,14 +1894,13 @@
     "button.retry.once": "Повторить один раз",
     "dialog.preset.load.title": "Загрузить пресет MecchaCamouflage",
     "dialog.preset.save.title": "Сохранить пресет MecchaCamouflage",
-    "dialog.preset.filter": "Пресет MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Пресет MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Чтение архива...",
+    "archive.status.strokes": "Записано штрихов: {0} | текстура {1}px",
+    "archive.status.textureOnly": "Записанных штрихов нет | архив только с текстурой {1}px; используйте предпросмотр"
   },
   "pl": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Metoda malowania",
-    "reuse.strategy.adaptive": "Adaptacyjna",
-    "reuse.strategy.contour": "Kontury",
-    "reuse.strategy.dominant": "Podkład i detale",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -2098,14 +2084,13 @@
     "button.retry.once": "Ponów raz",
     "dialog.preset.load.title": "Wczytaj ustawienie MecchaCamouflage",
     "dialog.preset.save.title": "Zapisz ustawienie MecchaCamouflage",
-    "dialog.preset.filter": "Ustawienie MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Ustawienie MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Odczytywanie archiwum...",
+    "archive.status.strokes": "Zapisane pociągnięcia: {0} | tekstura {1}px",
+    "archive.status.textureOnly": "Brak zapisanych pociągnięć | archiwum tylko z teksturą {1}px; użyj podglądu"
   },
   "tr": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Boyama yöntemi",
-    "reuse.strategy.adaptive": "Uyarlamalı",
-    "reuse.strategy.contour": "Kontur",
-    "reuse.strategy.dominant": "Zemin ve ayrıntı",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -2289,14 +2274,13 @@
     "button.retry.once": "Bir kez yeniden dene",
     "dialog.preset.load.title": "MecchaCamouflage ön ayarını yükle",
     "dialog.preset.save.title": "MecchaCamouflage ön ayarını kaydet",
-    "dialog.preset.filter": "MecchaCamouflage ön ayarı (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage ön ayarı (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Arşiv okunuyor...",
+    "archive.status.strokes": "{0} kayıtlı fırça darbesi | {1}px doku",
+    "archive.status.textureOnly": "Kayıtlı fırça darbesi yok | {1}px yalnızca doku arşivi; Önizleme kullanın"
   },
   "id": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Metode pengecatan",
-    "reuse.strategy.adaptive": "Adaptif",
-    "reuse.strategy.contour": "Kontur",
-    "reuse.strategy.dominant": "Dasar dan detail",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -2480,14 +2464,13 @@
     "button.retry.once": "Coba lagi sekali",
     "dialog.preset.load.title": "Muat preset MecchaCamouflage",
     "dialog.preset.save.title": "Simpan preset MecchaCamouflage",
-    "dialog.preset.filter": "Preset MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Preset MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Membaca arsip...",
+    "archive.status.strokes": "{0} goresan terekam | tekstur {1}px",
+    "archive.status.textureOnly": "Tidak ada goresan terekam | arsip hanya tekstur {1}px; gunakan Pratinjau"
   },
   "it": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Metodo di pittura",
-    "reuse.strategy.adaptive": "Adattivo",
-    "reuse.strategy.contour": "Contorni",
-    "reuse.strategy.dominant": "Base e dettagli",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -2671,14 +2654,13 @@
     "button.retry.once": "Riprova una volta",
     "dialog.preset.load.title": "Carica preimpostazione MecchaCamouflage",
     "dialog.preset.save.title": "Salva preimpostazione MecchaCamouflage",
-    "dialog.preset.filter": "Preimpostazione MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Preimpostazione MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Lettura archivio...",
+    "archive.status.strokes": "{0} tratti registrati | texture {1}px",
+    "archive.status.textureOnly": "Nessun tratto registrato | archivio solo texture {1}px; usa Anteprima"
   },
   "nl": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Schildermethode",
-    "reuse.strategy.adaptive": "Adaptief",
-    "reuse.strategy.contour": "Contouren",
-    "reuse.strategy.dominant": "Basis en details",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -2862,14 +2844,13 @@
     "button.retry.once": "Eenmaal opnieuw proberen",
     "dialog.preset.load.title": "MecchaCamouflage-voorinstelling laden",
     "dialog.preset.save.title": "MecchaCamouflage-voorinstelling opslaan",
-    "dialog.preset.filter": "MecchaCamouflage-voorinstelling (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "MecchaCamouflage-voorinstelling (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Archief lezen...",
+    "archive.status.strokes": "{0} opgenomen streken | {1}px textuur",
+    "archive.status.textureOnly": "Geen opgenomen streken | {1}px alleen-textuurarchief; gebruik Voorbeeld"
   },
   "vi": {
     "app.title": "Meccha Camouflage",
-    "reuse.strategy.label": "Cách tô màu",
-    "reuse.strategy.adaptive": "Thích ứng",
-    "reuse.strategy.contour": "Tô theo viền",
-    "reuse.strategy.dominant": "Nền và chi tiết",
     "body.mecho": "Mecho",
     "body.octopus": "Octopus",
     "body.porigon": "Porigon",
@@ -3053,6 +3034,9 @@
     "button.retry.once": "Thử lại một lần",
     "dialog.preset.load.title": "Tải cài đặt sẵn MecchaCamouflage",
     "dialog.preset.save.title": "Lưu cài đặt sẵn MecchaCamouflage",
-    "dialog.preset.filter": "Cài đặt sẵn MecchaCamouflage (*.mcpreset)|*.mcpreset"
+    "dialog.preset.filter": "Cài đặt sẵn MecchaCamouflage (*.mcpreset)|*.mcpreset",
+    "archive.status.reading": "Đang đọc tệp lưu...",
+    "archive.status.strokes": "{0} nét đã ghi | kết cấu {1}px",
+    "archive.status.textureOnly": "Không có nét đã ghi | tệp lưu chỉ có kết cấu {1}px; hãy dùng Xem trước"
   }
 }

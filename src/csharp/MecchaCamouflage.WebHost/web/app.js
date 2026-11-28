@@ -1285,15 +1285,15 @@ function initializeImageEditor() {
     button.addEventListener("click", () => runPaintRecordingCommand(button.dataset.paintRecordingCommand)
       .catch(error => showError(error.message || String(error))));
   }
-  for (const button of document.querySelectorAll("[data-reuse-paint-strategy]")) {
-    button.addEventListener("click", () => {
-      reusePaintStrategy = button.dataset.reusePaintStrategy;
-      renderReusePaintControls();
-    });
-  }
   const exportPath = byId("image-export-path");
-  exportPath.addEventListener("input", renderReusePaintControls);
-  exportPath.addEventListener("change", renderReusePaintControls);
+  exportPath.addEventListener("input", () => {
+    renderReusePaintControls();
+    schedulePaintArchiveStatusRefresh();
+  });
+  exportPath.addEventListener("change", () => {
+    renderReusePaintControls();
+    refreshPaintArchiveStatus().catch(() => {});
+  });
   refreshPaintExports().catch(() => {});
   input.addEventListener("change", event => {
     const files = Array.from(event.target.files || []);
@@ -2412,11 +2412,13 @@ async function saveImagePreset() {
 }
 
 let lastPaintExportManifest = "";
-let reusePaintStrategy = "adaptive";
 let reusePaintStartPending = false;
 let reusePaintPreviewPending = false;
 let reusePaintStopPending = false;
 let reusePaintStopPreviewPending = false;
+let paintArchiveStatus = { path: "", loading: false, success: false, message: "", textureSize: 0, strokeCount: 0, hasRecordedStrokes: false };
+let paintArchiveStatusTimer = null;
+let paintArchiveStatusRequest = 0;
 let paintRecording = { active: false, strokeCount: 0, source: "", dropped: 0 };
 let paintRecordingPending = false;
 let paintRecordingPollTimer = null;
@@ -2424,6 +2426,61 @@ let paintRecordingPollInFlight = false;
 
 function reusePaintPath() {
   return (byId("image-export-path")?.value || "").trim();
+}
+
+function paintArchiveStatusLabel() {
+  if (!reusePaintPath()) return "";
+  if (paintArchiveStatus.loading) return i18n("archive.status.reading");
+  if (!paintArchiveStatus.success) return paintArchiveStatus.message || "";
+  if (paintArchiveStatus.hasRecordedStrokes) {
+    return i18n("archive.status.strokes", paintArchiveStatus.strokeCount, paintArchiveStatus.textureSize);
+  }
+  return i18n("archive.status.textureOnly", paintArchiveStatus.textureSize);
+}
+
+function renderPaintArchiveStatus() {
+  const status = byId("image-archive-status");
+  if (!status) return;
+  const label = paintArchiveStatusLabel();
+  status.textContent = label;
+  status.classList.toggle("active", Boolean(paintArchiveStatus.hasRecordedStrokes));
+}
+
+async function refreshPaintArchiveStatus() {
+  const path = reusePaintPath();
+  const request = ++paintArchiveStatusRequest;
+  if (!path) {
+    paintArchiveStatus = { path: "", loading: false, success: false, message: "", textureSize: 0, strokeCount: 0, hasRecordedStrokes: false };
+    renderPaintArchiveStatus();
+    return;
+  }
+  paintArchiveStatus = { path, loading: true, success: false, message: "", textureSize: 0, strokeCount: 0, hasRecordedStrokes: false };
+  renderPaintArchiveStatus();
+  try {
+    const result = await send("inspectPaintExport", { manifestPath: path });
+    if (request !== paintArchiveStatusRequest || path !== reusePaintPath()) return;
+    paintArchiveStatus = {
+      path,
+      loading: false,
+      success: Boolean(result?.success),
+      message: result?.message || "",
+      textureSize: Number(result?.textureSize || 0),
+      strokeCount: Number(result?.strokeCount || 0),
+      hasRecordedStrokes: Boolean(result?.hasRecordedStrokes)
+    };
+  } catch (error) {
+    if (request !== paintArchiveStatusRequest || path !== reusePaintPath()) return;
+    paintArchiveStatus = { path, loading: false, success: false, message: error.message || String(error), textureSize: 0, strokeCount: 0, hasRecordedStrokes: false };
+  }
+  renderPaintArchiveStatus();
+}
+
+function schedulePaintArchiveStatusRefresh() {
+  if (paintArchiveStatusTimer !== null) clearTimeout(paintArchiveStatusTimer);
+  paintArchiveStatusTimer = setTimeout(() => {
+    paintArchiveStatusTimer = null;
+    refreshPaintArchiveStatus().catch(() => {});
+  }, 350);
 }
 
 function paintRecordingStatusLabel() {
@@ -2505,12 +2562,7 @@ function renderReusePaintControls() {
   const activePaintKind = runtime?.activePaintKind || "";
   const activePreviewKind = runtime?.activePreviewKind || "";
   const hasPath = reusePaintPath().length > 0;
-  for (const button of document.querySelectorAll("[data-reuse-paint-strategy]")) {
-    const selected = button.dataset.reusePaintStrategy === reusePaintStrategy;
-    button.classList.toggle("active", selected);
-    button.setAttribute("aria-pressed", String(selected));
-    button.disabled = running || reusePaintStartPending || reusePaintPreviewPending;
-  }
+  renderPaintArchiveStatus();
   const start = byId("image-reuse-start");
   if (start) start.disabled = !hasPath || running || reusePaintStartPending || reusePaintPreviewPending;
   const stop = byId("image-reuse-stop");
@@ -2538,6 +2590,16 @@ async function exportCurrentPaint() {
   if (!result?.success) throw new Error(result?.message || "The current paint could not be exported.");
   lastPaintExportManifest = result.manifestPath || "";
   setValue("image-export-path", result.manifestPath || result.directory || "");
+  const savedPath = reusePaintPath();
+  paintArchiveStatus = {
+    path: savedPath,
+    loading: false,
+    success: Boolean(savedPath) && Number(result.strokeCount || 0) >= 0,
+    message: "",
+    textureSize: Number(result.textureSize || 0),
+    strokeCount: Number(result.strokeCount || 0),
+    hasRecordedStrokes: Number(result.strokeCount || 0) > 0
+  };
   renderReusePaintControls();
   toast(i18n("toast.image.export.saved"));
 }
@@ -2579,7 +2641,7 @@ async function runReusePaintCommand(command) {
     renderReusePaintControls();
     toast(i18n("toast.image.export.replaying"));
     try {
-      const result = await send("reusePaintStart", { manifestPath, strategy: reusePaintStrategy }, 3600000);
+      const result = await send("reusePaintStart", { manifestPath }, 3600000);
       if (!result?.success) throw new Error(result?.message || "The saved paint could not be replayed.");
       lastPaintExportManifest = manifestPath;
       toast(i18n("toast.image.export.reused"));
@@ -2611,6 +2673,7 @@ async function refreshPaintExports() {
   lastPaintExportManifest = result.latest.manifestPath || "";
   setValue("image-export-path", result.latest.manifestPath || result.latest.directory || "");
   renderReusePaintControls();
+  refreshPaintArchiveStatus().catch(() => {});
 }
 
 async function stageImageDesignAsset(transferId, asset, data) {

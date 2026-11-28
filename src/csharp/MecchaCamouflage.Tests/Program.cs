@@ -103,13 +103,12 @@ var tests = new List<(string Name, Action Run)>
     ("image preset round-trips an uncompressed container", ImagePresetRoundTripsUncompressedContainer),
     ("paint texture archive normalizes manifest texture names", PaintTextureArchiveNormalizesManifest),
     ("paint stroke recording round-trips raw brush data", PaintStrokeRecordingRoundTripsRawData),
-    ("reuse paint prefers recorded strokes without texture resampling", ReusePaintUsesRecordedStrokes),
-    ("paint stroke archive compatibility keeps the texture fallback", PaintStrokeArchiveKeepsTextureFallback),
-    ("native stroke recording guards replay recursion", NativeStrokeRecordingGuardsReplay),
+    ("reuse paint uses recorded strokes only", ReusePaintUsesRecordedStrokes),
+    ("old texture-only archives direct users to Preview", PaintStrokeArchiveKeepsTextureFallback),
+    ("native stroke recording uses per-slot ProcessEvent originals", NativeStrokeRecordingGuardsReplay),
     ("web ui exposes paint stroke recording controls", WebUiExposesPaintStrokeRecording),
     ("paint stroke recording strings exist in every locale", PaintStrokeRecordingStringsExistInEveryLocale),
-    ("reuse paint start previews and stops through direct UV replay", ReusePaintRequestsDirectUvReplay),
-    ("native replay samples saved raw textures through the Image Paint mesh surface plan", NativeReplaySamplesMeshSurfacePlan),
+    ("reuse paint recorded-only commands keep preview", ReusePaintRequestsDirectUvReplay),
     ("v1 image preset expands global transforms to layers", V1ImagePresetExpandsGlobalTransformsToLayers),
     ("GUI image save persists the active preset state", GuiImageSavePersistsActivePresetState),
     ("legacy image config migrates to active image state", LegacyImageConfigMigratesToDiskLibrary),
@@ -3390,22 +3389,28 @@ static void WebUiEnablesReusePaintFromPathInput()
            app.Contains("const hasPath = reusePaintPath().length > 0", StringComparison.Ordinal) &&
            app.Contains("start.disabled = !hasPath || running", StringComparison.Ordinal) &&
            app.Contains("preview.disabled = !hasPath || running", StringComparison.Ordinal) &&
-           app.Contains("exportPath.addEventListener(\"input\", renderReusePaintControls)", StringComparison.Ordinal),
+           app.Contains("exportPath.addEventListener(\"input\"", StringComparison.Ordinal) &&
+           app.Contains("schedulePaintArchiveStatusRefresh", StringComparison.Ordinal),
         "Start and Preview must enable from non-empty path input text");
     Assert(app.Contains("activePaintKind !== \"reuse\"", StringComparison.Ordinal) &&
            app.Contains("activePreviewKind !== \"reuse\"", StringComparison.Ordinal) &&
-           app.Contains("send(\"reusePaintStart\", { manifestPath, strategy: reusePaintStrategy }", StringComparison.Ordinal) &&
+           app.Contains("send(\"reusePaintStart\", { manifestPath }", StringComparison.Ordinal) &&
            app.Contains("send(\"reusePaintPreview\", { manifestPath }", StringComparison.Ordinal) &&
            app.Contains("send(\"reusePaintStop\"", StringComparison.Ordinal) &&
            app.Contains("send(\"reusePaintStopPreview\"", StringComparison.Ordinal),
         "Stop and Stop Preview must follow the active Reuse Paint state and send the matching commands");
     Assert(!app.Contains("byId(\"image-reuse-paint\")", StringComparison.Ordinal),
         "the old single Reuse Paint action must be removed");
-    Assert(markup.Contains("data-reuse-paint-strategy=\"adaptive\" aria-pressed=\"true\"", StringComparison.Ordinal) &&
-           markup.Contains("data-reuse-paint-strategy=\"contour\"", StringComparison.Ordinal) &&
-           markup.Contains("data-reuse-paint-strategy=\"dominant\"", StringComparison.Ordinal) &&
-           app.Contains("button.setAttribute(\"aria-pressed\", String(selected))", StringComparison.Ordinal),
-        "Reuse Paint must offer all three strategies and expose the selected button");
+    Assert(!markup.Contains("data-reuse-paint-strategy", StringComparison.Ordinal) &&
+           !app.Contains("reusePaintStrategy", StringComparison.Ordinal) &&
+           !app.Contains("reuse.strategy.", StringComparison.Ordinal),
+        "Reuse Paint must not expose Adaptive/Contour/Base+Detail strategy controls");
+    Assert(markup.Contains("id=\"image-archive-status\"", StringComparison.Ordinal) &&
+           app.Contains("function refreshPaintArchiveStatus", StringComparison.Ordinal) &&
+           app.Contains("send(\"inspectPaintExport\", { manifestPath: path }", StringComparison.Ordinal) &&
+           app.Contains("archive.status.strokes", StringComparison.Ordinal) &&
+           app.Contains("archive.status.textureOnly", StringComparison.Ordinal),
+        "the UI must show the recorded-stroke status for the selected archive");
 }
 
 static void RuntimeSnapshotReportsManualPaintState()
@@ -5907,29 +5912,40 @@ static void ReusePaintUsesRecordedStrokes()
     var startMethod = host.IndexOf(
         "public async Task<PaintTextureReuseResult> StartReusePaintAsync",
         StringComparison.Ordinal);
+    var inspectMethod = host.IndexOf(
+        "public Task<PaintTextureInspectResult> InspectPaintExportAsync",
+        StringComparison.Ordinal);
     var stopPreviewMethod = host.IndexOf(
         "public async Task<HostCommandResult> StopReusePaintPreviewAsync",
         StringComparison.Ordinal);
-    Assert(startMethod >= 0 && stopPreviewMethod > startMethod,
-        "Reuse Paint start must remain discoverable");
-    var start = host[startMethod..stopPreviewMethod];
+    Assert(startMethod >= 0 && inspectMethod > startMethod && stopPreviewMethod > inspectMethod,
+        "Reuse Paint start, archive inspection, and stop-preview must remain discoverable");
+    var start = host[startMethod..inspectMethod];
     Assert(start.Contains("source.StrokesPath", StringComparison.Ordinal) &&
-           start.Contains("source.StrokeCount > 0", StringComparison.Ordinal) &&
+           start.Contains("source.StrokeCount <= 0", StringComparison.Ordinal) &&
            start.Contains("ReplayRecordedStrokesAsync(", StringComparison.Ordinal),
         "Reuse Paint must replay recorded strokes when the archive contains them");
-    Assert(start.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
-        "Reuse Paint must retain the texture replay strategy as a fallback");
+    Assert(start.Contains("archive_has_no_strokes", StringComparison.Ordinal) &&
+           start.Contains("Use Preview", StringComparison.Ordinal) &&
+           !start.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal) &&
+           !start.Contains("strategy", StringComparison.OrdinalIgnoreCase),
+        "Reuse Paint must not fall back to a texture strategy; texture-only archives direct the user to Preview");
+    var inspect = host[inspectMethod..stopPreviewMethod];
+    Assert(inspect.Contains("source.StrokeCount", StringComparison.Ordinal) &&
+           inspect.Contains("source.StrokeCount > 0", StringComparison.Ordinal) &&
+           inspect.Contains("TextureSize", StringComparison.Ordinal),
+        "the archive inspector must report the recorded-stroke count without applying paint");
 
     var exactStart = host.IndexOf(
         "public async Task<PaintTextureReplayResult> ReplayRecordedStrokesAsync",
         StringComparison.Ordinal);
-    var textureStart = host.IndexOf(
-        "public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync",
+    var exactEnd = host.IndexOf(
+        "private static (int TextureSize, int StrokeCount) ParseReplayMetadata",
         exactStart,
         StringComparison.Ordinal);
-    Assert(exactStart >= 0 && textureStart > exactStart,
+    Assert(exactStart >= 0 && exactEnd > exactStart,
         "the exact recorded-stroke replay method must remain discoverable");
-    var exact = host[exactStart..textureStart];
+    var exact = host[exactStart..exactEnd];
     Assert(exact.Contains("type = \"replay_recorded_strokes\"", StringComparison.Ordinal) &&
            exact.Contains("strokes_path = strokesPath", StringComparison.Ordinal) &&
            !exact.Contains("import_paint_texture", StringComparison.Ordinal),
@@ -6017,8 +6033,10 @@ static void PaintStrokeArchiveKeepsTextureFallback()
             "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
         Assert(host.Contains("TryReadPaintStrokesManifest", StringComparison.Ordinal) &&
                host.Contains("strokes_file", StringComparison.Ordinal) &&
-               host.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
-            "old texture-only archives must continue through the texture replay fallback");
+               host.Contains("PreviewPaintTextureAsync(", StringComparison.Ordinal) &&
+               host.Contains("archive_has_no_strokes", StringComparison.Ordinal) &&
+               !host.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
+            "old texture-only archives must not use a strategy; Start directs the user to Preview");
     }
     finally
     {
@@ -6047,6 +6065,16 @@ static void NativeStrokeRecordingGuardsReplay()
     Assert(bridge.Contains("function_address == g_recorded_strokes_function.load", StringComparison.Ordinal) &&
            bridge.Contains("g_recorded_strokes_component.load", StringComparison.Ordinal),
         "the ProcessEvent detour must filter to the local component and PaintAtUVWithBrush");
+    Assert(bridge.Contains("resolve_process_event_original(", StringComparison.Ordinal) &&
+           bridge.Contains("for (const auto& entry : g_process_event_hook_slots)", StringComparison.Ordinal) &&
+           !bridge.Contains("hook_process_event_original_mismatch", StringComparison.Ordinal),
+        "each ProcessEvent vtable slot must chain through its own verified original instead of rejecting a different UE entry point");
+    Assert(bridge.Contains("g_recorded_strokes_suppress.fetch_add(1", StringComparison.Ordinal) &&
+           bridge.Contains("g_recorded_strokes_suppress.fetch_sub(1", StringComparison.Ordinal),
+        "replay calls must bracket their PaintAtUVWithBrush transport with recording suppression");
+    Assert(bridge.Contains("g_recorded_strokes_hook_slot", StringComparison.Ordinal) &&
+           bridge.Contains("uninstall_process_event_vtable_hook_slot(", StringComparison.Ordinal),
+        "Stop must restore the exact patched vtable slot even after the component pointer goes stale");
     Assert(bridge.Contains("is_replay_recorded_strokes_request", StringComparison.Ordinal) &&
            bridge.Contains("start_mesh_first_paint_async_job(job->request, job)", StringComparison.Ordinal),
         "recorded-stroke replay must reuse the existing async paint dispatcher");
@@ -6090,6 +6118,12 @@ static void WebUiExposesPaintStrokeRecording()
            app.Contains("start.disabled = !hasPath || running", StringComparison.Ordinal) &&
            app.Contains("preview.disabled = !hasPath || running", StringComparison.Ordinal),
         "the existing Reuse Paint Start/Stop/Preview/Stop Preview and path enablement must not regress");
+    Assert(!markup.Contains("data-reuse-paint-strategy", StringComparison.Ordinal) &&
+           !app.Contains("reusePaintStrategy", StringComparison.Ordinal) &&
+           markup.Contains("id=\"image-archive-status\"", StringComparison.Ordinal) &&
+           form.Contains("case \"inspectPaintExport\"", StringComparison.Ordinal) &&
+           form.Contains("InspectPaintExportAsync", StringComparison.Ordinal),
+        "the UI must replace the three paint strategies with a recorded-stroke status");
 }
 
 static void PaintStrokeRecordingStringsExistInEveryLocale()
@@ -6099,10 +6133,15 @@ static void PaintStrokeRecordingStringsExistInEveryLocale()
     {
         "recording.title", "recording.idle", "recording.active", "recording.stopped",
         "button.record.stop", "button.record.clear",
-        "toast.recording.started", "toast.recording.stopped", "toast.recording.cleared"
+        "toast.recording.started", "toast.recording.stopped", "toast.recording.cleared",
+        "archive.status.reading", "archive.status.strokes", "archive.status.textureOnly"
     };
     foreach (var locale in LocalizationCatalog.SupportedLocales)
     {
+        Assert(string.Equals(catalog.Text(locale.Code, "reuse.strategy.adaptive"), "reuse.strategy.adaptive", StringComparison.Ordinal) &&
+               string.Equals(catalog.Text(locale.Code, "reuse.strategy.contour"), "reuse.strategy.contour", StringComparison.Ordinal) &&
+               string.Equals(catalog.Text(locale.Code, "reuse.strategy.dominant"), "reuse.strategy.dominant", StringComparison.Ordinal),
+            $"{locale.Code} must not retain the removed Reuse Paint strategy strings");
         foreach (var key in keys)
         {
             Assert(!string.Equals(catalog.Text(locale.Code, key), key, StringComparison.Ordinal),
@@ -6126,31 +6165,25 @@ static void ReusePaintRequestsDirectUvReplay()
     var startMethod = host.IndexOf(
         "public async Task<PaintTextureReuseResult> StartReusePaintAsync",
         StringComparison.Ordinal);
+    var inspectMethod = host.IndexOf(
+        "public Task<PaintTextureInspectResult> InspectPaintExportAsync",
+        StringComparison.Ordinal);
     var stopPreviewMethod = host.IndexOf(
         "public async Task<HostCommandResult> StopReusePaintPreviewAsync",
         StringComparison.Ordinal);
-    var replayStart = host.IndexOf(
-        "public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync",
-        StringComparison.Ordinal);
-    Assert(startMethod >= 0 && stopPreviewMethod > startMethod && replayStart > stopPreviewMethod,
-        "HostSession must expose separate Reuse Paint start, stop-preview, and direct replay methods");
-    var start = host[startMethod..stopPreviewMethod];
+    Assert(startMethod >= 0 && inspectMethod > startMethod && stopPreviewMethod > inspectMethod,
+        "HostSession must expose Reuse Paint start, archive inspection, and stop-preview");
+    var start = host[startMethod..inspectMethod];
     Assert(start.Contains("TryPreparePaintTextureSource", StringComparison.Ordinal) &&
-           host.Contains("PaintTextureArchive.Extract", StringComparison.Ordinal) &&
-           start.Contains("source.AlbedoPath", StringComparison.Ordinal) &&
-           start.Contains("source.PbrPath", StringComparison.Ordinal),
-        "Reuse Paint Start must extract the archive and replay its raw albedo/PBR files");
-    Assert(!start.Contains("ImportPaintTextureAsync(", StringComparison.Ordinal) &&
-           !start.Contains("ImportPaintTextureInternalAsync(", StringComparison.Ordinal),
-        "Reuse Paint Start must not perform a local import before replaying");
-    Assert(start.Contains("Settings.Image.BrushSizeTexels", StringComparison.Ordinal) &&
-           start.Contains("Settings.Image.ColorCompressionTolerance", StringComparison.Ordinal) &&
-           start.Contains("Math.Max(1, (int)(brushSizeTexels / 2.0))", StringComparison.Ordinal),
-        "Reuse Paint Start must use the Image brush size, derived step, and compression tolerance");
-    Assert(start.Contains("TryDeleteDirectory(source.TempDirectory)", StringComparison.Ordinal),
-        "Reuse Paint Start must clean the extracted temporary texture after the command response");
-    Assert(start.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
-        "Reuse Paint Start must run the direct UV replay");
+           start.Contains("ReplayRecordedStrokesAsync(", StringComparison.Ordinal) &&
+           !start.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
+        "Reuse Paint Start must replay the recorded strokes and must not use a texture replay strategy");
+    Assert(start.Contains("archive_has_no_strokes", StringComparison.Ordinal) &&
+           start.Contains("Use Preview", StringComparison.Ordinal),
+        "texture-only archives must direct the user to Preview instead of inventing strokes");
+    Assert(!host.Contains("PaintReplayStrategy", StringComparison.Ordinal) &&
+           !host.Contains("replay_strategy", StringComparison.Ordinal),
+        "the C# host must not expose Adaptive/Contour/Base+Detail strategies");
 
     var previewStart = host.IndexOf(
         "public async Task<PaintTextureImportResult> PreviewPaintTextureAsync",
@@ -6165,37 +6198,10 @@ static void ReusePaintRequestsDirectUvReplay()
     Assert(preview.Contains("preservePreviewSnapshot: true", StringComparison.Ordinal) &&
            preview.Contains("activePreviewKind = PaintKind.Reuse", StringComparison.Ordinal),
         "Reuse Paint Preview must import locally while preserving the pre-preview snapshot");
-    var stopPreview = host[stopPreviewMethod..replayStart];
-    Assert(stopPreview.Contains("activePreviewKind != PaintKind.Reuse", StringComparison.Ordinal) &&
-           stopPreview.Contains("unpreviewOnly: true", StringComparison.Ordinal),
-        "Stop Preview must restore the snapshot through the existing unpreview path");
     Assert(host.Contains("preview_only = preservePreviewSnapshot", StringComparison.Ordinal),
         "the local import payload must request native preview snapshot preservation");
 
-    var replayEnd = host.IndexOf(
-        "ParseReplayMetadata(string raw)",
-        replayStart,
-        StringComparison.Ordinal);
-    Assert(replayEnd > replayStart, "replay method boundary must remain discoverable");
-    var replay = host[replayStart..replayEnd];
-    Assert(replay.Contains("[\"type\"] = \"replay_paint_texture\"", StringComparison.Ordinal),
-        "Reuse Paint must send replay_paint_texture");
-    Assert(replay.Contains("[\"replay_strategy\"] = strategyName", StringComparison.Ordinal) &&
-           replay.Contains("PaintReplayStrategy.Contour => \"contour\"", StringComparison.Ordinal) &&
-           replay.Contains("PaintReplayStrategy.Dominant => \"dominant\"", StringComparison.Ordinal),
-        "Reuse Paint must send the strategy selected by the user");
-    Assert(replay.Contains("[\"albedo_path\"]", StringComparison.Ordinal) &&
-           replay.Contains("[\"pbr_path\"]", StringComparison.Ordinal),
-        "direct replay must send the extracted raw albedo and PBR paths");
-    Assert(replay.Contains("[\"color_compression_tolerance\"]", StringComparison.Ordinal) &&
-           replay.Contains("[\"step_texels\"]", StringComparison.Ordinal),
-        "direct replay must send the Image compression tolerance and derived step");
-    Assert(replay.Contains("Runtime.SendPaintAsync", StringComparison.Ordinal),
-        "direct UV replay must use the production paint command path");
-    Assert(!replay.Contains("import_paint_texture", StringComparison.Ordinal),
-        "replay must not use local import as its transport");
-
-    Assert(form.Contains("session.StartReusePaintAsync(manifestPath, strategy: selection.Value)", StringComparison.Ordinal) &&
+    Assert(form.Contains("session.StartReusePaintAsync(manifestPath)", StringComparison.Ordinal) &&
            form.Contains("session.PreviewPaintTextureAsync(manifestPath)", StringComparison.Ordinal) &&
            form.Contains("session.StopReusePaintPreviewAsync()", StringComparison.Ordinal) &&
            form.Contains("session.StopPaintAsync()", StringComparison.Ordinal),
@@ -6204,12 +6210,18 @@ static void ReusePaintRequestsDirectUvReplay()
            form.Contains("PaintTextureArchive.Extension", StringComparison.Ordinal) &&
            form.Contains("\".json\"", StringComparison.Ordinal),
         "the Reuse Paint commands must accept existing .mcpaint and legacy .json paths");
+    Assert(form.Contains("case \"inspectPaintExport\"", StringComparison.Ordinal) &&
+           form.Contains("InspectPaintExportAsync", StringComparison.Ordinal) &&
+           form.Contains("hasRecordedStrokes", StringComparison.Ordinal),
+        "the host must expose the archive stroke status without applying paint");
     Assert(index.Contains("data-reuse-paint-command=\"start\"", StringComparison.Ordinal) &&
            index.Contains("data-reuse-paint-command=\"stop\"", StringComparison.Ordinal) &&
            index.Contains("data-reuse-paint-command=\"preview\"", StringComparison.Ordinal) &&
            index.Contains("data-reuse-paint-command=\"stopPreview\"", StringComparison.Ordinal) &&
+           index.Contains("id=\"image-archive-status\"", StringComparison.Ordinal) &&
+           !index.Contains("data-reuse-paint-strategy", StringComparison.Ordinal) &&
            !index.Contains("id=\"image-reuse-paint\"", StringComparison.Ordinal),
-        "the web UI must replace the single Reuse Paint button with the four actions");
+        "the web UI must keep the four Reuse Paint actions with a status line and no strategy selector");
     Assert(app.Contains("function renderReusePaintControls()", StringComparison.Ordinal) &&
            app.Contains("reusePaintStart", StringComparison.Ordinal) &&
            app.Contains("reusePaintPreview", StringComparison.Ordinal) &&
@@ -6218,101 +6230,12 @@ static void ReusePaintRequestsDirectUvReplay()
            app.Contains("toast.image.export.reused", StringComparison.Ordinal) &&
            app.Contains("toast.image.export.previewed", StringComparison.Ordinal),
         "the web UI must enable the four Reuse Paint actions and show progress and completion toasts");
-}
-
-static void NativeReplaySamplesMeshSurfacePlan()
-{
-    var root = FindRepositoryRoot();
-    var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
-
-    Assert(bridge.Contains("\\\"type\\\":\\\"replay_paint_texture\\\"", StringComparison.Ordinal),
-        "native request matching must include replay_paint_texture");
-    Assert(bridge.Contains("is_replay_paint_texture_request", StringComparison.Ordinal),
-        "native dispatch must route the replay command explicitly");
-    Assert(bridge.Contains("start_mesh_first_paint_async_job(job->request, job)", StringComparison.Ordinal),
-        "replay must reuse the existing async paint job dispatcher");
-
-    var start = bridge.IndexOf(
-        "auto replay_paint_texture_on_game_thread",
-        StringComparison.Ordinal);
-    var end = bridge.IndexOf(
-        "auto start_mesh_first_paint_async_job",
-        start,
-        StringComparison.Ordinal);
-    Assert(start >= 0 && end > start, "native replay handler must remain discoverable");
-    var body = bridge[start..end];
-    Assert(body.Contains("json_string_field(request, \"albedo_path\"", StringComparison.Ordinal) &&
-           body.Contains("json_string_field(request, \"pbr_path\"", StringComparison.Ordinal) &&
-           body.Contains("read_binary_file_w(utf8_to_wstring(albedo_path)", StringComparison.Ordinal) &&
-           body.Contains("read_binary_file_w(utf8_to_wstring(pbr_path)", StringComparison.Ordinal),
-        "replay must read the provided raw albedo and PBR files when present");
-    Assert(body.Contains("mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo)", StringComparison.Ordinal) &&
-           body.Contains("sdk::EPaintChannel::Metallic", StringComparison.Ordinal),
-        "replay must retain the current-game-texture fallback");
-    Assert(body.Contains("runtime_triangle_cache", StringComparison.Ordinal) &&
-           body.Contains("mesh_first_resolve_runtime_triangle_cache", StringComparison.Ordinal) &&
-           body.Contains("mesh_first_generate_plan_samples_from_runtime_cache", StringComparison.Ordinal) &&
-           body.Contains("std::vector<MeshFirstPlanSample> plan_samples", StringComparison.Ordinal),
-        "replay must reuse the Image Paint runtime-triangle/plan sample generation");
-    Assert(body.Contains("sdk_collect_front_mesh_candidates", StringComparison.Ordinal) &&
-           body.Contains("select_mesh_first_profile_for_candidate", StringComparison.Ordinal) &&
-           body.Contains("mesh_first_profile_metadata(profile)", StringComparison.Ordinal),
-        "replay must resolve the live mesh profile/UV before sampling");
-    Assert(!body.Contains("CanonicalImageAtlas", StringComparison.Ordinal) &&
-           !body.Contains("image_paint_rgba_base64", StringComparison.Ordinal) &&
-           !body.Contains("image_reference_profile", StringComparison.Ordinal),
-        "replay must not use the 4-face image or canonical atlas");
-    Assert(body.Contains("image_paint_brush_size_texels", StringComparison.Ordinal) &&
-           body.Contains("replay_sample_spacing_texels", StringComparison.Ordinal) &&
-           body.Contains("detail_brush_texels,", StringComparison.Ordinal),
-        "replay must generate a mesh sample grid at the detail brush density");
-    Assert(!body.Contains("within_previous_color", StringComparison.Ordinal) &&
-           !body.Contains("compression_threshold", StringComparison.Ordinal) &&
-           !body.Contains("color_compression_enabled", StringComparison.Ordinal),
-        "replay must not skip mesh samples based on previous stroke color or compression");
-    Assert(!body.Contains("albedo.bytes[offset + 3U]", StringComparison.Ordinal) &&
-           body.Contains("alpha_skipping", StringComparison.Ordinal),
-        "replay must not drop mesh samples based on the paint texture alpha");
-    Assert(body.Contains("paint_texture_replay::Texture{texture_size, albedo.bytes, packed_pbr.bytes}", StringComparison.Ordinal) &&
-           body.Contains("texture.sample(sample.u, sample.v)", StringComparison.Ordinal) &&
-           !body.Contains("texture_size_denominator", StringComparison.Ordinal) &&
-           !body.Contains("grid_width", StringComparison.Ordinal),
-        "replay must sample albedo and packed PBR at each mesh sample UV instead of a texture grid");
-    Assert(!body.Contains("appearance_srgb_to_linear", StringComparison.Ordinal),
-        "replay must preserve the raw albedo values used by Preview");
-    Assert(body.Contains("sdk::FRuntimeBrushSettings brush{}", StringComparison.Ordinal) &&
-           !body.Contains("RuntimePaintable_CurrentBrushSettings", StringComparison.Ordinal),
-        "replay must use a solid brush so an active brush texture cannot alter the saved color");
-    var basePass = body.IndexOf("for (const auto& base : replay_plan.base_strokes)", StringComparison.Ordinal);
-    var detailPass = body.IndexOf("const float stroke_radius = replay_plan.radii[sample_index]", StringComparison.Ordinal);
-    Assert(body.Contains("paint_texture_replay::plan_replay", StringComparison.Ordinal) &&
-           body.Contains("json_string_field(request, \"replay_strategy\", \"adaptive\")", StringComparison.Ordinal) &&
-           basePass >= 0 && detailPass > basePass,
-        "replay must plan the chosen strategy and queue the base strokes ahead of the details");
-    Assert(body.Contains("sdk_make_uv_stroke(", StringComparison.Ordinal) &&
-           body.Contains("sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive", StringComparison.Ordinal),
-        "replay must build channel-7 UV strokes");
-    Assert(body.Contains("sdk::EPaintChannelApplyMode::Override", StringComparison.Ordinal),
-        "replay strokes must use Override apply mode");
-    Assert(bridge.Contains("sdk_call_paint_at_uv_with_brush", StringComparison.Ordinal) &&
-           bridge.Contains("PaintAtUVWithBrush", StringComparison.Ordinal),
-        "replay must keep the game's PaintAtUVWithBrush production route");
-
-    var importStart = bridge.LastIndexOf(
-        "auto import_paint_texture_on_game_thread",
-        StringComparison.Ordinal);
-    var importEnd = bridge.IndexOf(
-        "auto is_export_paint_texture_request",
-        importStart,
-        StringComparison.Ordinal);
-    Assert(importStart >= 0 && importEnd > importStart,
-        "native import handler must remain discoverable");
-    var import = bridge[importStart..importEnd];
-    Assert(import.Contains("preview_only", StringComparison.Ordinal) &&
-           import.Contains("mesh_first_store_preview_snapshot", StringComparison.Ordinal) &&
-           import.Contains("mesh_first_export_channel_bytes", StringComparison.Ordinal) &&
-           import.Contains("mesh_first_clear_preview_snapshot", StringComparison.Ordinal),
-        "Reuse Paint Preview must preserve the pre-preview texture snapshot before importing");
+    Assert(!app.Contains("reusePaintStrategy", StringComparison.Ordinal) &&
+           !app.Contains("reuse.strategy.", StringComparison.Ordinal) &&
+           app.Contains("inspectPaintExport", StringComparison.Ordinal) &&
+           app.Contains("archive.status.strokes", StringComparison.Ordinal) &&
+           app.Contains("archive.status.textureOnly", StringComparison.Ordinal),
+        "the web UI must show recorded-stroke status and must not expose strategy controls");
 }
 
 static string FindRepositoryRoot()

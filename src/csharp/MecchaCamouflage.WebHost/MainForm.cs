@@ -1175,6 +1175,8 @@ public sealed class MainForm : Form
                 return ApplyPaintResult(await HandleReusePaintPreviewAsync(command.Payload));
             case "reusePaintStopPreview":
                 return ApplyPaintResult(await session.StopReusePaintPreviewAsync());
+            case "inspectPaintExport":
+                return await HandleInspectPaintExportAsync(command.Payload);
             case "listPaintExports":
                 return session.GetLatestPaintExport();
             case "paint":
@@ -1334,21 +1336,27 @@ public sealed class MainForm : Form
     {
         if (!TryReadPaintExportPath(payload, out var manifestPath, out var message))
             return new HostCommandResult(false, message, CommandResultLevel.Warn);
-        var strategy = payload.TryGetProperty("strategy", out var value) ? value.ToString() : "adaptive";
-        PaintReplayStrategy? selection = strategy switch
-        {
-            "adaptive" => PaintReplayStrategy.Adaptive,
-            "contour" => PaintReplayStrategy.Contour,
-            "dominant" => PaintReplayStrategy.Dominant,
-            _ => null
-        };
-        if (selection is null)
-            return new HostCommandResult(false, "The selected paint strategy is invalid.", CommandResultLevel.Warn);
-        var result = await session.StartReusePaintAsync(manifestPath, strategy: selection.Value);
+        var result = await session.StartReusePaintAsync(manifestPath);
         return new HostCommandResult(
             result.Success,
             result.Message,
             result.Success ? CommandResultLevel.Success : CommandResultLevel.Error);
+    }
+
+    private async Task<object> HandleInspectPaintExportAsync(JsonElement payload)
+    {
+        if (!TryReadPaintExportPath(payload, out var manifestPath, out var message))
+            return new { success = false, message };
+        var result = await session.InspectPaintExportAsync(manifestPath);
+        return new
+        {
+            success = result.Success,
+            message = result.Message,
+            textureSize = result.TextureSize,
+            strokeCount = result.StrokeCount,
+            strokeSource = result.StrokeSource,
+            hasRecordedStrokes = result.HasRecordedStrokes
+        };
     }
 
     private async Task<HostCommandResult> HandleReusePaintPreviewAsync(JsonElement payload)

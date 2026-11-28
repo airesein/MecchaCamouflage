@@ -907,10 +907,6 @@ body.editing #image-fill-section.disabled .field-label {
   padding: 8px 0 0;
 }
 
-.reuse-paint-strategies {
-  grid-column: 1 / -1;
-}
-
 .record-status {
   display: flex;
   grid-column: 1 / -1;

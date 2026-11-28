@@ -416,6 +416,7 @@ namespace
     // future call path goes through the patched vtable instead.
     std::atomic<int> g_recorded_strokes_suppress{0};
     std::atomic<bool> g_recorded_strokes_hook_owned{false};
+    std::atomic<std::uintptr_t> g_recorded_strokes_hook_slot{0};
     std::mutex g_recorded_strokes_source_mutex;
     std::string g_recorded_strokes_source{"none"};
 
@@ -1786,6 +1787,46 @@ namespace
     {
         return address_in_main_module(address) || address_in_bridge_module(address) ||
                address_in_resident_direct_bridge_module(address);
+    }
+
+    // Each hooked vtable slot keeps its own verified original. UE builds can
+    // expose more than one ProcessEvent entry point (for example a class with a
+    // different thunk), so a single global "original" must never be assumed to
+    // match every object. Resolving per object also keeps ESP/other hooks
+    // chaining through the exact function their slot replaced.
+    auto resolve_process_event_original(std::uintptr_t object) -> std::uintptr_t
+    {
+        const auto fallback = g_original_process_event.load(std::memory_order_acquire);
+        if (!object)
+        {
+            return fallback;
+        }
+        const auto vtable = safe_read<std::uintptr_t>(object);
+        if (!vtable)
+        {
+            return fallback;
+        }
+        const auto slot_address =
+            vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t);
+        const auto hook = reinterpret_cast<std::uintptr_t>(&hooked_process_event);
+        const auto slot = safe_read<std::uintptr_t>(slot_address);
+        // The common case is an unhooked object: use its vtable entry directly
+        // without taking the hook lock on every ProcessEvent call.
+        if (slot && slot != hook)
+        {
+            return trusted_process_event_target(slot) ? slot : fallback;
+        }
+        {
+            std::lock_guard<std::mutex> hook_lock(g_hook_mutex);
+            for (const auto& entry : g_process_event_hook_slots)
+            {
+                if (entry.first == slot_address)
+                {
+                    return entry.second;
+                }
+            }
+        }
+        return fallback;
     }
 
     auto live_uobject(std::uintptr_t object) -> bool
@@ -3251,21 +3292,11 @@ namespace
 
     auto process_event(std::uintptr_t object, std::uintptr_t function, std::uint8_t* params, std::string& failure) -> bool
     {
-        auto target = g_original_process_event.load();
+        const auto target = resolve_process_event_original(object);
         if (!target)
         {
-            const auto vtable = safe_read<std::uintptr_t>(object);
-            if (!vtable)
-            {
-                failure = "vtable_unavailable";
-                return false;
-            }
-            target = safe_read<std::uintptr_t>(vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t));
-            if (!target)
-            {
-                failure = "process_event_unavailable";
-                return false;
-            }
+            failure = "process_event_unavailable";
+            return false;
         }
         if (!trusted_process_event_target(target))
         {
@@ -3945,14 +3976,21 @@ namespace
             return false;
         }
         const auto slot_address = vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t);
-        const auto original = safe_read<std::uintptr_t>(slot_address);
-        if (!trusted_process_event_target(original))
+        const auto hook = reinterpret_cast<std::uintptr_t>(&hooked_process_event);
+        auto original = safe_read<std::uintptr_t>(slot_address);
+        if (original == hook)
+        {
+            // The slot already points at our detour but is not tracked (for
+            // example a partially-torn-down generation). Reuse the verified
+            // original instead of creating a self-referential chain.
+            original = g_original_process_event.load(std::memory_order_acquire);
+        }
+        if (!original || original == hook || !trusted_process_event_target(original))
         {
             failure = "hook_process_event_target_untrusted";
             return false;
         }
 
-        const auto hook = reinterpret_cast<std::uintptr_t>(&hooked_process_event);
         std::lock_guard<std::mutex> hook_lock(g_hook_mutex);
         for (const auto& entry : g_process_event_hook_slots)
         {
@@ -3960,12 +3998,6 @@ namespace
             {
                 return true;
             }
-        }
-        const auto existing_original = g_original_process_event.load();
-        if (existing_original && existing_original != original)
-        {
-            failure = "hook_process_event_original_mismatch";
-            return false;
         }
 
         DWORD old_protect = 0;
@@ -3979,7 +4011,13 @@ namespace
         FlushInstructionCache(GetCurrentProcess(), slot, sizeof(std::uintptr_t));
         DWORD ignored = 0;
         VirtualProtect(slot, sizeof(std::uintptr_t), old_protect, &ignored);
-        g_original_process_event.store(original);
+        // Keep the first verified original only as a late-callback fallback.
+        // Chaining uses the per-slot original through
+        // resolve_process_event_original().
+        if (!g_original_process_event.load(std::memory_order_acquire))
+        {
+            g_original_process_event.store(original, std::memory_order_release);
+        }
         g_process_event_hook_slots.push_back({slot_address, original});
         if (installed_new)
         {
@@ -3988,19 +4026,12 @@ namespace
         return true;
     }
 
-    auto uninstall_process_event_vtable_hook_for_object(std::uintptr_t object) -> bool
+    auto uninstall_process_event_vtable_hook_slot(std::uintptr_t slot_address) -> bool
     {
-        if (!live_uobject(object))
+        if (!slot_address)
         {
             return false;
         }
-        const auto vtable = safe_read<std::uintptr_t>(object);
-        if (!vtable)
-        {
-            return false;
-        }
-        const auto slot_address =
-            vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t);
         const auto hook = reinterpret_cast<std::uintptr_t>(&hooked_process_event);
         std::lock_guard<std::mutex> hook_lock(g_hook_mutex);
         for (auto entry = g_process_event_hook_slots.begin();
@@ -4029,6 +4060,21 @@ namespace
             return true;
         }
         return true;
+    }
+
+    auto uninstall_process_event_vtable_hook_for_object(std::uintptr_t object) -> bool
+    {
+        if (!live_uobject(object))
+        {
+            return false;
+        }
+        const auto vtable = safe_read<std::uintptr_t>(object);
+        if (!vtable)
+        {
+            return false;
+        }
+        return uninstall_process_event_vtable_hook_slot(
+            vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t));
     }
 
     auto uninstall_message_hook() -> void
@@ -25027,6 +25073,13 @@ namespace
                                      : hook_failure,
                                  "\"route\":\"start_stroke_recording\"");
         }
+        const auto recording_vtable = safe_read<std::uintptr_t>(ctx.component);
+        const auto recording_slot =
+            recording_vtable
+                ? recording_vtable +
+                      static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t)
+                : 0;
+        g_recorded_strokes_hook_slot.store(recording_slot, std::memory_order_release);
         if (installed_new_hook)
         {
             g_recorded_strokes_hook_owned.store(true, std::memory_order_release);
@@ -25055,8 +25108,18 @@ namespace
             g_recorded_strokes_active.exchange(false, std::memory_order_acq_rel);
         if (g_recorded_strokes_hook_owned.exchange(false, std::memory_order_acq_rel))
         {
-            uninstall_process_event_vtable_hook_for_object(
-                g_recorded_strokes_component.load(std::memory_order_acquire));
+            // Restore through the exact slot we patched so Stop still works
+            // after a respawn invalidates the object pointer.
+            const auto slot = g_recorded_strokes_hook_slot.exchange(0, std::memory_order_acq_rel);
+            if (!uninstall_process_event_vtable_hook_slot(slot))
+            {
+                uninstall_process_event_vtable_hook_for_object(
+                    g_recorded_strokes_component.load(std::memory_order_acquire));
+            }
+        }
+        else
+        {
+            g_recorded_strokes_hook_slot.store(0, std::memory_order_release);
         }
         std::string metadata = recorded_stroke_metadata("stop_stroke_recording");
         metadata += ",\"was_active\":" + std::string(json_bool(was_active));
@@ -27409,11 +27472,23 @@ namespace
         params.ChannelData = stroke.ChannelData;
         params.BrushSettings = stroke.BrushSettings;
         params.Channel = stroke.TargetChannel;
+        if (!allow_recording)
+        {
+            // Reuse Paint replay must never feed itself back into the recording,
+            // even if a future call path reaches the patched vtable instead of
+            // the verified original.
+            g_recorded_strokes_suppress.fetch_add(1, std::memory_order_acq_rel);
+        }
         const bool ok =
             process_event(component, function, reinterpret_cast<std::uint8_t*>(&params), failure);
+        if (!allow_recording)
+        {
+            g_recorded_strokes_suppress.fetch_sub(1, std::memory_order_acq_rel);
+        }
         // The app's own normal paint is part of the session the user may want to
         // reuse. Reuse Paint passes allow_recording=false so its replay never
-        // appends to the recording.
+        // appends to the recording. Game-originated brush strokes are captured
+        // by the ProcessEvent detour instead.
         if (ok && allow_recording &&
             g_recorded_strokes_active.load(std::memory_order_acquire))
         {
@@ -30474,8 +30549,8 @@ namespace
         metadata += ",\"pbr_bytes\":" + std::to_string(packed_pbr.bytes.size());
 
         // Export Paint also carries the raw recorded brush history when the
-        // user was recording while painting. Older sessions simply have no
-        // strokes and continue to rely on the texture replay fallback.
+        // user was recording while painting. Archives without strokes remain
+        // valid for the local texture Preview but cannot be Reuse Paint targets.
         const int recorded_count =
             g_recorded_strokes_count.load(std::memory_order_acquire);
         const auto recorded_source = recorded_strokes_source();
@@ -30858,7 +30933,8 @@ namespace
     void __fastcall hooked_process_event(void* object, void* function, void* params)
     {
         g_active_hook_callbacks.fetch_add(1);
-        const auto original = g_original_process_event.load();
+        const auto original =
+            resolve_process_event_original(reinterpret_cast<std::uintptr_t>(object));
         if (function && params)
         {
             __try
@@ -37547,6 +37623,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         g_recorded_strokes_active.store(false, std::memory_order_release);
         g_recorded_strokes_suppress.store(0, std::memory_order_release);
         g_recorded_strokes_hook_owned.store(false, std::memory_order_release);
+        g_recorded_strokes_hook_slot.store(0, std::memory_order_release);
         {
             std::lock_guard<std::mutex> config_lock(g_esp_native_config_mutex);
             g_esp_native_config_signature.clear();

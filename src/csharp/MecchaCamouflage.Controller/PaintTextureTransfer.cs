@@ -5,13 +5,6 @@ using System.Text.Json.Nodes;
 
 namespace MecchaCamouflage.Controller;
 
-public enum PaintReplayStrategy
-{
-    Adaptive,
-    Contour,
-    Dominant
-}
-
 public sealed record PaintTextureExportResult(
     bool Success,
     string Message,
@@ -46,6 +39,14 @@ public sealed record PaintTextureReuseResult(
     int TextureSize = 0,
     int StrokeCount = 0,
     bool UsedRecordedStrokes = false);
+
+public sealed record PaintTextureInspectResult(
+    bool Success,
+    string Message,
+    int TextureSize = 0,
+    int StrokeCount = 0,
+    string StrokeSource = "",
+    bool HasRecordedStrokes = false);
 
 public sealed record PaintStrokeSample(
     double U,
