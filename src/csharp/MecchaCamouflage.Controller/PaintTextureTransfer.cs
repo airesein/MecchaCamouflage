@@ -100,7 +100,25 @@ public sealed record PaintStrokeRecordingStatus(
     string ZeroCountReason = "",
     int DiscoveryPaintCalls = 0,
     int DiscoveryPaintIgnoredReceiver = 0,
-    string DiscoverySummary = "");
+    string DiscoverySummary = "",
+    int CapturedPackedPaintBatches = 0,
+    int DecodedPackedStrokes = 0,
+    int PackedDuplicateStrokes = 0,
+    int PackedBatchMode = 0,
+    int PackedBatchBytes = 0,
+    int PackedBatchDeclaredCount = 0,
+    int PackedBatchGroupCount = 0,
+    bool PackedCountMismatch = false,
+    bool PackedConverterHook = false,
+    string PackedConverterRoute = "",
+    string PackedConverterFailure = "",
+    string HookRoute = "",
+    bool GlobalProcessEventHookActive = false,
+    bool GlobalProcessEventHookAttempted = false,
+    int GlobalProcessEventHookTargets = 0,
+    int GlobalProcessEventHookInstalledTargets = 0,
+    int GlobalProcessEventHookLastStatus = 0,
+    string GlobalProcessEventHookFailure = "");
 
 /// <summary>
 /// Portable representation of the game's recorded PaintAtUVWithBrush

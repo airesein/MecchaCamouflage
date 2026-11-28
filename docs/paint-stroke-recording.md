@@ -13,8 +13,62 @@ UFunction by reflection, and captures:
   component's `CurrentBrushSettings` at the time of the call.
 - `PaintStroke`, `PaintStrokeBatch`, server/relay/send stroke batches, and other
   reflected paint functions whose stroke payload is recognized.
-- As a fallback, the game's `QueuedLocalPaintBatches` and `StrokeChunkBuffer`
-  arrays if they still retain strokes when recording stops.
+- `RuntimePaintableComponent.MulticastPackedPaintBatchToOthers` /
+  `MulticastPackedPaintBatch` (`TArray<uint8> PackedData`, `int32 StrokeCount`),
+  the route the shipping first-person brush actually uses. The game decodes the
+  packed bytes and expands each `CompactPaintStroke` into a full `PaintStroke`
+  through its own native converter; the bridge captures that converted result.
+- As a fallback, the game's `GetRecordedStrokeBatch` backing array (the
+  component's `TArray<FPaintStroke>` recorded queue), plus the
+  `QueuedLocalPaintBatches` / `QueuedOutgoingBatches` / `StrokeChunkBuffer`
+  manager arrays if they still retain strokes when recording stops.
+
+### Packed paint batch layout (build 2026-11-16)
+
+The UFunction is not a full `FPaintStroke` array. It receives an opaque byte
+buffer plus a stroke count:
+
+| offset | size | meaning |
+| --- | --- | --- |
+| `0x00` | 1 | mode: `1..3` delta stroke stream, `4` grouped stream |
+| `0x01` | 16 | `FGuid ReplicationSourceId` shared by the batch |
+| `0x11` | 4 | `uint32` declared stroke count; matches the RPC `StrokeCount` |
+| `0x15` | 2 | `uint16` group count (mode `4` only) |
+| `0x17` | ... | grouped payload (mode `4`) |
+| `0x15` | ... | delta payload (modes `1..3`) |
+
+Decoded elements are `CompactPaintStroke` (`0x40` bytes): skeletal triangle
+index, six barycentric bytes, `Radius` at `0x0C`, BGRA albedo/metallic/
+roughness/emissive, target channel, effective subdivision fields, and the shared
+replication GUID at `0x30`. The game expands these through
+`CompactPaintStroke -> PaintStroke`; that converter reconstructs the UV from the
+skeletal triangle anchor and preserves each stroke's `Radius`. The bridge hooks
+that converter and records the expanded `FPaintStroke`, including the
+per-stroke brush size, instead of re-quantising the packed bytes. If the
+converter cannot be located, the component's recorded queue is read at each
+batch and at Stop; both paths use a content hash for de-duplication.
+
+Packed batches are parsed and reported with `packed_batch_mode`,
+`packed_batch_bytes`, `packed_batch_declared_count`,
+`packed_batch_group_count`, `packed_batch_count_mismatch`, and
+`decoded_packed_strokes`.
+
+### Discovered native route (build 2026-11-16)
+
+These are image-relative RVAs for the shipping build; dynamic discovery runs
+first and these are only a fallback/validation anchor:
+
+- `UFunction::Func` native thunk at `UFunction + 0xD8`.
+- `MulticastPackedPaintBatchToOthers` thunk RVA `0x6549230`, which calls the
+  receiver vtable slot `+0x538`.
+- Multicast implementation RVA `0x657ED40`.
+- Packed decoder RVA `0x6581790` (`bool DecodePacked(TArray<uint8>, int32,
+  TArray<CompactPaintStroke>&)`).
+- Compact apply RVA `0x6580470`.
+- `CompactPaintStroke -> PaintStroke` converter RVA `0x6580180`
+  (`PaintStroke* Converter(component, out, const CompactPaintStroke*)`).
+- `GetRecordedStrokeBatch` reads component `+0x230` (Data), `+0x238` (Num),
+  and `+0x2C4` (retained high-water) directly.
 
 Each entry stores the exact value parameters the game receives:
 
@@ -69,14 +123,29 @@ parameter size. The status response exposes:
   `captured_paint_at_world_position`, `captured_paint_at_uv`,
   `captured_stroke_batches`, `captured_server_stroke_batches`,
   `captured_native_strokes`, `captured_recorded_queue_strokes`
-- `global_process_event_hook` and `zero_count_reason`
+- `global_process_event_hook`, `global_process_event_hook_attempted`,
+  `global_process_event_hook_targets`,
+  `global_process_event_hook_installed_targets`,
+  `global_process_event_hook_failure`, `packed_converter_hook`,
+  `packed_converter_route`, `packed_converter_failure`, `hook_route`, and
+  `zero_count_reason`
 
 `zero_count_reason` distinguishes `no_paint_ufunctions_resolved`,
 `no_paint_process_event_calls_observed`,
 `paint_calls_observed_on_nonlocal_receivers`,
-`paint_calls_observed_without_capture_layout`, and
-`paint_calls_observed_without_reflected_spec`. That makes a `count=0` log
+`paint_calls_observed_without_capture_layout`,
+`paint_calls_observed_without_reflected_spec`,
+`packed_batch_decode_hook_unavailable`, and
+`packed_batch_observed_but_no_decoded_strokes`. That makes a `count=0` log
 actionable instead of repeating the same counters.
+
+`global_process_event_hook` is the state that was active during the take, not
+the post-uninstall state. Stop used to uninstall the hook before building its
+metadata, so a working global MinHook still logged `false`. The status now keeps
+a per-take snapshot (`global_process_event_hook_active`), reports the MinHook
+attempt/target/status/failure, and the per-component vtable detour remains the
+verified route if MinHook cannot attach to the game's ProcessEvent entry point
+(for example because UE4SS already owns that trampoline).
 
 ## `.mcpaint` compatibility
 
@@ -148,10 +217,15 @@ reports `stroke_count`, `stroke_source`, and `strokes_written` in its metadata.
   reflection. If a future build calls a native paint method directly, discovery
   reports `no_paint_process_event_calls_observed` and the recorded-queue fallback
   is the only capture source.
-- Compact stroke batches (`CompactPaintStrokeBatch`) are detected and listed by
-  discovery but are only captured when the reflected payload is a full
-  `FPaintStroke` array or when the game's recorded queue still retains the
-  strokes.
+- Compact/packed stroke batches are decoded by the game's own native converter.
+  The bridge does not re-implement the delta/grouped payload compression; it
+  discovers the converter through the multicast UFunction thunk (with a
+  build-2026-11-16 RVA fallback) and captures the expanded `FPaintStroke`. If
+  the converter hook cannot be installed, the component's `GetRecordedStrokeBatch`
+  backing array is the exact fallback. The packed bytes themselves carry the
+  per-stroke radius but not the original hardness/opacity/spacing/falloff/
+  blend/rotation/tip values; the converter supplies the current brush values for
+  those fields.
 - Recording is bound to the local body/controller resolved when Record was
   pressed. Respawning or switching to a different body can require starting a
   new recording.

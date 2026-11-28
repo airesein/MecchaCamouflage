@@ -106,6 +106,7 @@ var tests = new List<(string Name, Action Run)>
     ("reuse paint uses recorded strokes only", ReusePaintUsesRecordedStrokes),
     ("old texture-only archives direct users to Preview", PaintStrokeArchiveKeepsTextureFallback),
     ("native stroke recording uses per-slot ProcessEvent originals", NativeStrokeRecordingGuardsReplay),
+    ("native packed paint batches decode into per-stroke brush", NativePackedPaintBatchDecoding),
     ("web ui exposes paint stroke recording controls", WebUiExposesPaintStrokeRecording),
     ("paint stroke recording strings exist in every locale", PaintStrokeRecordingStringsExistInEveryLocale),
     ("reuse paint recorded-only commands keep preview", ReusePaintRequestsDirectUvReplay),
@@ -6055,16 +6056,18 @@ static void NativeStrokeRecordingGuardsReplay()
            bridge.Contains("export_strokes_on_game_thread", StringComparison.Ordinal) &&
            bridge.Contains("replay_recorded_strokes_on_game_thread", StringComparison.Ordinal),
         "native must expose start/stop/clear/export/replay recording commands");
-    Assert(bridge.Contains("recorded_strokes_capture(params)", StringComparison.Ordinal) &&
+    Assert(bridge.Contains("recorded_strokes_capture(params", StringComparison.Ordinal) &&
            bridge.Contains("allow_recording", StringComparison.Ordinal) &&
            bridge.Contains("g_recorded_strokes_suppress", StringComparison.Ordinal),
         "the app's own paint must be recordable while replay is suppressed");
     Assert(bridge.Contains("suppress_stroke_recording = true", StringComparison.Ordinal) &&
            bridge.Contains("!job->suppress_stroke_recording", StringComparison.Ordinal),
         "replay jobs must never append their own PaintAtUVWithBrush calls to the recording");
-    Assert(bridge.Contains("function_address == g_recorded_strokes_function.load", StringComparison.Ordinal) &&
-           bridge.Contains("g_recorded_strokes_component.load", StringComparison.Ordinal),
-        "the ProcessEvent detour must filter to the local component and PaintAtUVWithBrush");
+    Assert(bridge.Contains("recorded_strokes_capture_spec_begin_call", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_receiver_is_local", StringComparison.Ordinal) &&
+           bridge.Contains("g_recorded_spec_guard", StringComparison.Ordinal) &&
+           bridge.Contains("paint_at_uv_with_brush", StringComparison.Ordinal),
+        "the ProcessEvent detours must filter to the local component and PaintAtUVWithBrush without double-capturing nested global/per-component calls");
     Assert(bridge.Contains("resolve_process_event_original(", StringComparison.Ordinal) &&
            bridge.Contains("for (const auto& entry : g_process_event_hook_slots)", StringComparison.Ordinal) &&
            !bridge.Contains("hook_process_event_original_mismatch", StringComparison.Ordinal),
@@ -6119,6 +6122,56 @@ static void NativeStrokeRecordingGuardsReplay()
            bridge.Contains("captured_recorded_queue_strokes", StringComparison.Ordinal) &&
            bridge.Contains("captured_server_stroke_batches", StringComparison.Ordinal),
         "the recorded-stroke queue and server/batch sources must be captured and counted as fallbacks");
+}
+
+static void NativePackedPaintBatchDecoding()
+{
+    var root = FindRepositoryRoot();
+    var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
+    var layout = ReadRepositoryText(Path.Combine(root, "src", "native", "include", "packed_paint_batch.hpp"));
+    var recording = ReadRepositoryText(Path.Combine(root, "src", "native", "include", "paint_stroke_recording.hpp"));
+    var transfer = ReadRepositoryText(Path.Combine(root, "src", "csharp", "MecchaCamouflage.Controller", "PaintTextureTransfer.cs"));
+
+    Assert(layout.Contains("HeaderSize = 0x15", StringComparison.Ordinal) &&
+           layout.Contains("GroupedHeaderSize = 0x17", StringComparison.Ordinal) &&
+           layout.Contains("ModeGrouped = 4", StringComparison.Ordinal) &&
+           layout.Contains("declared_count", StringComparison.Ordinal) &&
+           layout.Contains("group_count", StringComparison.Ordinal) &&
+           layout.Contains("packed_header_too_short", StringComparison.Ordinal) &&
+           layout.Contains("packed_mode_unsupported", StringComparison.Ordinal),
+        "packed batches must expose their mode/source GUID/count/group-count header and reject short or unknown payloads");
+    Assert(bridge.Contains("RecordedPaintKind::PackedStrokeBatch", StringComparison.Ordinal) &&
+           bridge.Contains("PackedData", StringComparison.Ordinal) &&
+           bridge.Contains("StrokeCount", StringComparison.Ordinal) &&
+           bridge.Contains("packed_paint_batch::parse_header", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_packed_scope_begin", StringComparison.Ordinal),
+        "MulticastPackedPaintBatchToOthers(TArray<uint8>, int32) must be a reflected capture spec, not paint_calls_observed_without_reflected_spec");
+    Assert(bridge.Contains("hooked_packed_paint_converter", StringComparison.Ordinal) &&
+           bridge.Contains("packed_paint_batch_decode", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_capture_component_history", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_baseline_component_history", StringComparison.Ordinal) &&
+           bridge.Contains("RuntimePaintable_RecordedStrokes", StringComparison.Ordinal),
+        "the game's compact->full stroke converter must be captured, with the component recorded queue as the exact fallback");
+    Assert(bridge.Contains("recorded_strokes_capture_stroke(\n                    stroke, \"packed_paint_batch_decode\", true)", StringComparison.Ordinal) ||
+           bridge.Contains("packed_paint_batch_decode\", true", StringComparison.Ordinal),
+        "batch captures must dedupe against app PaintAtUVWithBrush captures without suppressing the app route");
+    Assert(bridge.Contains("packed_batch_decode_hook_unavailable", StringComparison.Ordinal) &&
+           bridge.Contains("packed_batch_observed_but_no_decoded_strokes", StringComparison.Ordinal) &&
+           bridge.Contains("captured_packed_paint_batches", StringComparison.Ordinal) &&
+           bridge.Contains("decoded_packed_strokes", StringComparison.Ordinal) &&
+           bridge.Contains("packed_batch_mode", StringComparison.Ordinal),
+        "zero-count diagnostics must distinguish an unavailable decode hook from a batch that decoded zero strokes");
+    Assert(bridge.Contains("g_recorded_strokes_packed_hook_active", StringComparison.Ordinal) &&
+           bridge.Contains("g_recorded_strokes_global_hook_active", StringComparison.Ordinal) &&
+           bridge.Contains("global_process_event_hook_attempted", StringComparison.Ordinal) &&
+           bridge.Contains("global_process_event_hook_installed_targets", StringComparison.Ordinal) &&
+           bridge.Contains("hook_route", StringComparison.Ordinal),
+        "Stop must report the hook route that was active during the take instead of the post-uninstall false state");
+    Assert(transfer.Contains("CapturedPackedPaintBatches", StringComparison.Ordinal) &&
+           transfer.Contains("DecodedPackedStrokes", StringComparison.Ordinal) &&
+           transfer.Contains("PackedConverterRoute", StringComparison.Ordinal) &&
+           recording.Contains("NativeSource", StringComparison.Ordinal),
+        "the host status record must carry decoded packed counts and the converter route");
 }
 
 static void WebUiExposesPaintStrokeRecording()

@@ -320,7 +320,7 @@ public sealed class HostSession
             if (label == "start")
                 Log.Info($"Stroke recording started | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource}");
             else if (label == "stop")
-                Log.Info($"Stroke recording stopped | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource} | uv_with_brush={status.CapturedPaintAtUVWithBrush} | screen_position={status.CapturedPaintAtScreenPosition} | world_position={status.CapturedPaintAtWorldPosition} | batches={status.CapturedStrokeBatches} | server_batches={status.CapturedServerStrokeBatches} | queue={status.CapturedRecordedQueueStrokes} | events={status.PaintEventsObserved}/{status.PaintEventsCaptured} | ignored_receiver={status.PaintEventsIgnoredReceiver} | layout_unavailable={status.PaintEventsLayoutUnavailable} | global_hook={status.GlobalProcessEventHook} | zero_reason={status.ZeroCountReason} | discovered={status.DiscoverySummary}");
+                Log.Info($"Stroke recording stopped | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource} | uv_with_brush={status.CapturedPaintAtUVWithBrush} | screen_position={status.CapturedPaintAtScreenPosition} | world_position={status.CapturedPaintAtWorldPosition} | batches={status.CapturedStrokeBatches} | server_batches={status.CapturedServerStrokeBatches} | packed_batches={status.CapturedPackedPaintBatches} | decoded_packed={status.DecodedPackedStrokes} | packed_mode={status.PackedBatchMode} | packed_bytes={status.PackedBatchBytes} | queue={status.CapturedRecordedQueueStrokes} | events={status.PaintEventsObserved}/{status.PaintEventsCaptured} | ignored_receiver={status.PaintEventsIgnoredReceiver} | layout_unavailable={status.PaintEventsLayoutUnavailable} | global_hook={status.GlobalProcessEventHook} | hook_route={status.HookRoute} | packed_route={status.PackedConverterRoute} | zero_reason={status.ZeroCountReason} | discovered={status.DiscoverySummary}");
             else if (label == "clear")
                 Log.Info("Stroke recording cleared.");
             return status;
@@ -423,7 +423,25 @@ public sealed class HostSession
                 Text(metadata, "zero_count_reason", ""),
                 Int(metadata, "discovery_paint_calls", 0),
                 Int(metadata, "discovery_paint_ignored_receiver", 0),
-                discovered);
+                discovered,
+                Int(metadata, "captured_packed_paint_batches", 0),
+                Int(metadata, "decoded_packed_strokes", 0),
+                Int(metadata, "packed_duplicate_strokes", 0),
+                Int(metadata, "packed_batch_mode", 0),
+                Int(metadata, "packed_batch_bytes", 0),
+                Int(metadata, "packed_batch_declared_count", 0),
+                Int(metadata, "packed_batch_group_count", 0),
+                Bool(metadata, "packed_batch_count_mismatch", false),
+                Bool(metadata, "packed_converter_hook", false),
+                Text(metadata, "packed_converter_route", ""),
+                Text(metadata, "packed_converter_failure", ""),
+                Text(metadata, "hook_route", ""),
+                Bool(metadata, "global_process_event_hook_active", false),
+                Bool(metadata, "global_process_event_hook_attempted", false),
+                Int(metadata, "global_process_event_hook_targets", 0),
+                Int(metadata, "global_process_event_hook_installed_targets", 0),
+                Int(metadata, "global_process_event_hook_last_status", 0),
+                Text(metadata, "global_process_event_hook_failure", ""));
         }
         catch (JsonException)
         {

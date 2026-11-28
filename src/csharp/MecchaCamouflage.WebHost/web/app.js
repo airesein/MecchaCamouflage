@@ -2509,6 +2509,15 @@ function applyPaintRecordingStatus(result) {
     capturedServerStrokeBatches: Number(result.capturedServerStrokeBatches || 0),
     capturedNativeStrokes: Number(result.capturedNativeStrokes || 0),
     capturedRecordedQueueStrokes: Number(result.capturedRecordedQueueStrokes || 0),
+    capturedPackedPaintBatches: Number(result.capturedPackedPaintBatches || 0),
+    decodedPackedStrokes: Number(result.decodedPackedStrokes || 0),
+    packedDuplicateStrokes: Number(result.packedDuplicateStrokes || 0),
+    packedBatchMode: Number(result.packedBatchMode || 0),
+    packedBatchBytes: Number(result.packedBatchBytes || 0),
+    packedConverterHook: Boolean(result.packedConverterHook),
+    packedConverterRoute: result.packedConverterRoute || "",
+    packedConverterFailure: result.packedConverterFailure || "",
+    hookRoute: result.hookRoute || "",
     paintEventsObserved: Number(result.paintEventsObserved || 0),
     paintEventsCaptured: Number(result.paintEventsCaptured || 0),
     paintEventsIgnoredReceiver: Number(result.paintEventsIgnoredReceiver || 0),
@@ -2599,7 +2608,7 @@ function renderReusePaintControls() {
   if (recordStatus) {
     recordStatus.textContent = paintRecordingStatusLabel();
     const capture = [paintRecording.recordingSource, paintRecording.source].filter(Boolean).join(" | ");
-    const counts = `uv_with_brush=${paintRecording.capturedPaintAtUVWithBrush} screen_position=${paintRecording.capturedPaintAtScreenPosition} world_position=${paintRecording.capturedPaintAtWorldPosition} uv=${paintRecording.capturedPaintAtUV} batches=${paintRecording.capturedStrokeBatches} server_batches=${paintRecording.capturedServerStrokeBatches} native=${paintRecording.capturedNativeStrokes} queue=${paintRecording.capturedRecordedQueueStrokes} events=${paintRecording.paintEventsObserved}/${paintRecording.paintEventsCaptured} ignored_receiver=${paintRecording.paintEventsIgnoredReceiver} layout_unavailable=${paintRecording.paintEventsLayoutUnavailable} global_hook=${paintRecording.globalProcessEventHook}${paintRecording.zeroCountReason ? ` zero_reason=${paintRecording.zeroCountReason}` : ""}${paintRecording.discoverySummary ? ` discovered=${paintRecording.discoverySummary}` : ""}`;
+    const counts = `uv_with_brush=${paintRecording.capturedPaintAtUVWithBrush} screen_position=${paintRecording.capturedPaintAtScreenPosition} world_position=${paintRecording.capturedPaintAtWorldPosition} uv=${paintRecording.capturedPaintAtUV} batches=${paintRecording.capturedStrokeBatches} server_batches=${paintRecording.capturedServerStrokeBatches} packed_batches=${paintRecording.capturedPackedPaintBatches} decoded_packed=${paintRecording.decodedPackedStrokes} packed_mode=${paintRecording.packedBatchMode} native=${paintRecording.capturedNativeStrokes} queue=${paintRecording.capturedRecordedQueueStrokes} events=${paintRecording.paintEventsObserved}/${paintRecording.paintEventsCaptured} ignored_receiver=${paintRecording.paintEventsIgnoredReceiver} layout_unavailable=${paintRecording.paintEventsLayoutUnavailable} global_hook=${paintRecording.globalProcessEventHook} hook_route=${paintRecording.hookRoute} packed_route=${paintRecording.packedConverterRoute}${paintRecording.zeroCountReason ? ` zero_reason=${paintRecording.zeroCountReason}` : ""}${paintRecording.discoverySummary ? ` discovered=${paintRecording.discoverySummary}` : ""}`;
     recordStatus.title = capture ? `${capture} | ${counts}` : counts;
     recordStatus.classList.toggle("active", paintRecording.active);
   }

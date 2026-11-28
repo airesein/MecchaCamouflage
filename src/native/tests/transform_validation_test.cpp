@@ -1,6 +1,7 @@
 #include "../include/sdk.hpp"
 #include "../include/runtime_contract.hpp"
 #include "../include/direct_bridge_abi.hpp"
+#include "../include/packed_paint_batch.hpp"
 #include "../include/paint_stroke_recording.hpp"
 #include "../include/paint_texture_replay.hpp"
 
@@ -22,6 +23,77 @@ namespace
 
 int main()
 {
+    {
+        // Packed paint batch header round-trip. The RPC carries TArray<uint8>
+        // plus StrokeCount; the header stores the mode, a shared replication
+        // GUID, the declared stroke count, and (grouped mode) a group count.
+        std::array<std::uint8_t, 0x40> packed{};
+        packed[0] = packed_paint_batch::ModeGrouped;
+        for (std::uint8_t index = 0; index < 16; ++index)
+        {
+            packed[1 + index] = static_cast<std::uint8_t>(0x10 + index);
+        }
+        const std::uint32_t declared = 7;
+        packed[0x11] = static_cast<std::uint8_t>(declared & 0xFF);
+        packed[0x12] = static_cast<std::uint8_t>((declared >> 8) & 0xFF);
+        packed[0x13] = static_cast<std::uint8_t>((declared >> 16) & 0xFF);
+        packed[0x14] = static_cast<std::uint8_t>((declared >> 24) & 0xFF);
+        packed[0x15] = 0x03;
+        packed[0x16] = 0x00;
+        const auto grouped = packed_paint_batch::parse_header(
+            packed.data(), packed.size(), declared);
+        if (!grouped.ok ||
+            grouped.mode != packed_paint_batch::ModeGrouped ||
+            grouped.declared_count != declared ||
+            !grouped.count_matches_rpc ||
+            grouped.group_count != 3 ||
+            grouped.payload_offset != packed_paint_batch::GroupedHeaderSize ||
+            grouped.replication_source_id.A != 0x13121110u ||
+            grouped.replication_source_id.B != 0x17161514u ||
+            grouped.replication_source_id.C != 0x1B1A1918u ||
+            grouped.replication_source_id.D != 0x1F1E1D1Cu)
+        {
+            return 132;
+        }
+        packed[0] = packed_paint_batch::ModeDelta;
+        const auto delta = packed_paint_batch::parse_header(
+            packed.data(), packed.size(), declared);
+        if (!delta.ok || delta.mode != packed_paint_batch::ModeDelta ||
+            delta.payload_offset != packed_paint_batch::HeaderSize ||
+            delta.group_count != 0)
+        {
+            return 133;
+        }
+        const auto mismatch = packed_paint_batch::parse_header(
+            packed.data(), packed.size(), declared + 1);
+        if (!mismatch.ok || mismatch.count_matches_rpc)
+        {
+            return 134;
+        }
+        const auto short_header = packed_paint_batch::parse_header(
+            packed.data(), 8, declared);
+        if (short_header.ok || short_header.failure != "packed_header_too_short")
+        {
+            return 135;
+        }
+        packed[0] = 9;
+        const auto bad_mode = packed_paint_batch::parse_header(
+            packed.data(), packed.size(), declared);
+        if (bad_mode.ok || bad_mode.failure != "packed_mode_unsupported")
+        {
+            return 136;
+        }
+        // Per-stroke brush size lives in CompactPaintStroke::Radius; the bridge
+        // captures the game's converter output rather than re-quantising it.
+        if (sizeof(sdk::CompactPaintStroke) != 0x40 ||
+            offsetof(sdk::CompactPaintStroke, Radius) != 0x0C ||
+            offsetof(sdk::CompactPaintStroke, AlbedoColor) != 0x10 ||
+            offsetof(sdk::CompactPaintStroke, TargetChannel) != 0x1C ||
+            offsetof(sdk::CompactPaintStroke, ReplicationSourceId) != 0x30)
+        {
+            return 137;
+        }
+    }
     {
         // Recorded paint strokes must serialise the raw PaintAtUVWithBrush
         // parameters and parse back without colour-space or lossy conversion.

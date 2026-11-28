@@ -26,6 +26,12 @@ namespace sdk
                 0x05F0;
         constexpr std::uintptr_t BP_FirstPersonCharacter_RuntimePaintable = 0x0B68;
         constexpr std::uintptr_t RuntimePaintable_CurrentBrushSettings = 0x0170;
+        // GetRecordedStrokeBatch()/GetRecordedStrokeCount() in the shipping
+        // RuntimePaintableComponent read this TArray<FPaintStroke> directly.
+        // +0x2C4 is the retained high-water marker used by the same accessor.
+        constexpr std::uintptr_t RuntimePaintable_RecordedStrokes = 0x0230;
+        constexpr std::uintptr_t RuntimePaintable_RecordedStrokeCount = 0x0238;
+        constexpr std::uintptr_t RuntimePaintable_RecordedStrokeHighWater = 0x02C4;
         constexpr std::uintptr_t SceneCapture2D_CaptureComponent2D = 0x02B8;
         constexpr std::uintptr_t SceneCaptureComponent_CaptureSource = 0x0241;
         constexpr std::uintptr_t SceneCaptureComponent_CaptureFlags = 0x0242;
@@ -309,6 +315,35 @@ namespace sdk
         FGuid ReplicationSourceId{};
     };
 
+    // Decoded element of CompactPaintStrokeBatch / the packed paint RPC.  The
+    // game expands this into FPaintStroke before applying or replaying it; the
+    // per-stroke brush radius is preserved at offset 0x0C.
+    struct CompactPaintStroke
+    {
+        std::int32_t SkeletalTriangleIndex{0};
+        std::uint8_t BarycentricXHigh{0};
+        std::uint8_t BarycentricXLow{0};
+        std::uint8_t BarycentricYHigh{0};
+        std::uint8_t BarycentricYLow{0};
+        std::uint8_t BarycentricZHigh{0};
+        std::uint8_t BarycentricZLow{0};
+        std::uint8_t Pad_0A[0x2]{};
+        float Radius{0.02f};
+        FColor AlbedoColor{};
+        std::uint8_t Metallic{0};
+        std::uint8_t Roughness{0};
+        std::uint8_t Pad_16[0x2]{};
+        FColor EmissiveColor{};
+        EPaintChannel TargetChannel{EPaintChannel::Albedo};
+        std::uint8_t Pad_1D[0x3]{};
+        float EffectiveBrushWorldRadius{0.02f};
+        std::uint8_t EffectiveSubdivisionLevel{0};
+        std::uint8_t Pad_25[0x3]{};
+        float EffectiveSubdivisionPixelSize{1.0f};
+        std::int32_t EffectiveTemplateResolution{0};
+        FGuid ReplicationSourceId{};
+    };
+
     struct RuntimePaintableComponent_PaintAtUVWithBrush
     {
         FVector2D Uv{};
@@ -415,6 +450,11 @@ namespace sdk
     static_assert(offsetof(FPaintStroke, BrushSettings) == 0x68, "PaintStroke BrushSettings offset mismatch");
     static_assert(offsetof(FPaintStroke, ChannelData) == 0x90, "PaintStroke ChannelData offset mismatch");
     static_assert(offsetof(FPaintStroke, TargetChannel) == 0xB4, "PaintStroke TargetChannel offset mismatch");
+    static_assert(sizeof(CompactPaintStroke) == 0x40, "CompactPaintStroke layout mismatch");
+    static_assert(offsetof(CompactPaintStroke, Radius) == 0x0C, "CompactPaintStroke Radius offset mismatch");
+    static_assert(offsetof(CompactPaintStroke, AlbedoColor) == 0x10, "CompactPaintStroke AlbedoColor offset mismatch");
+    static_assert(offsetof(CompactPaintStroke, TargetChannel) == 0x1C, "CompactPaintStroke TargetChannel offset mismatch");
+    static_assert(offsetof(CompactPaintStroke, ReplicationSourceId) == 0x30, "CompactPaintStroke ReplicationSourceId offset mismatch");
     static_assert(sizeof(RuntimePaintableComponent_PaintAtUVWithBrush) == 0x68, "PaintAtUVWithBrush params layout mismatch");
     static_assert(sizeof(Actor_K2_GetActorLocation) == 0x18, "K2_GetActorLocation params layout mismatch");
     static_assert(sizeof(KismetRenderingLibrary_CreateRenderTarget2D) == 0x30, "CreateRenderTarget2D params layout mismatch");
