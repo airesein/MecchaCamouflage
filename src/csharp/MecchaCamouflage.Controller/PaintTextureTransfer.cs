@@ -85,7 +85,22 @@ public sealed record PaintStrokeRecordingStatus(
     long Dropped,
     string RecordingSource = "",
     int CapturedPaintAtUVWithBrush = 0,
-    int CapturedPaintAtScreenPosition = 0);
+    int CapturedPaintAtScreenPosition = 0,
+    int CapturedPaintAtWorldPosition = 0,
+    int CapturedPaintAtUV = 0,
+    int CapturedStrokeBatches = 0,
+    int CapturedServerStrokeBatches = 0,
+    int CapturedNativeStrokes = 0,
+    int CapturedRecordedQueueStrokes = 0,
+    int PaintEventsObserved = 0,
+    int PaintEventsCaptured = 0,
+    int PaintEventsIgnoredReceiver = 0,
+    int PaintEventsLayoutUnavailable = 0,
+    bool GlobalProcessEventHook = false,
+    string ZeroCountReason = "",
+    int DiscoveryPaintCalls = 0,
+    int DiscoveryPaintIgnoredReceiver = 0,
+    string DiscoverySummary = "");
 
 /// <summary>
 /// Portable representation of the game's recorded PaintAtUVWithBrush

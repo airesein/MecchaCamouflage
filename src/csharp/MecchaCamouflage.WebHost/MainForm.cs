@@ -1305,6 +1305,21 @@ public sealed class MainForm : Form
         recordingSource = status.RecordingSource,
         capturedPaintAtUVWithBrush = status.CapturedPaintAtUVWithBrush,
         capturedPaintAtScreenPosition = status.CapturedPaintAtScreenPosition,
+        capturedPaintAtWorldPosition = status.CapturedPaintAtWorldPosition,
+        capturedPaintAtUV = status.CapturedPaintAtUV,
+        capturedStrokeBatches = status.CapturedStrokeBatches,
+        capturedServerStrokeBatches = status.CapturedServerStrokeBatches,
+        capturedNativeStrokes = status.CapturedNativeStrokes,
+        capturedRecordedQueueStrokes = status.CapturedRecordedQueueStrokes,
+        paintEventsObserved = status.PaintEventsObserved,
+        paintEventsCaptured = status.PaintEventsCaptured,
+        paintEventsIgnoredReceiver = status.PaintEventsIgnoredReceiver,
+        paintEventsLayoutUnavailable = status.PaintEventsLayoutUnavailable,
+        globalProcessEventHook = status.GlobalProcessEventHook,
+        zeroCountReason = status.ZeroCountReason,
+        discoveryPaintCalls = status.DiscoveryPaintCalls,
+        discoveryPaintIgnoredReceiver = status.DiscoveryPaintIgnoredReceiver,
+        discoverySummary = status.DiscoverySummary,
         dropped = status.Dropped
     };
 

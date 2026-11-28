@@ -62,8 +62,9 @@ namespace
     // intentionally placed next to the recorded-stroke state at the top of the
     // file. The full guarded implementations live with the other safe readers.
     template <typename T>
-    auto safe_read(std::uintptr_t address, T fallback) -> T;
+    auto safe_read(std::uintptr_t address, T fallback = T{}) -> T;
     auto safe_copy(void* dest, const void* src, std::size_t size) -> bool;
+    auto live_uobject(std::uintptr_t object) -> bool;
 
     // =============================================================================
     // Section: Runtime globals, diagnostics, and bridge-side state
@@ -429,6 +430,28 @@ namespace
     std::atomic<int> g_recorded_strokes_world_position_count{0};
     std::atomic<int> g_recorded_strokes_screen_position_empty{0};
     std::atomic<int> g_recorded_strokes_ignored_receiver_count{0};
+    // Additional source counters make a zero-stroke recording explainable: the
+    // global ProcessEvent filter can observe paint functions without capturing
+    // them (non-local receiver, unknown layout), and the manager queue can be
+    // sampled as a fallback when the game never reflects a painting call.
+    std::atomic<int> g_recorded_strokes_uv_count{0};
+    std::atomic<int> g_recorded_strokes_batch_count{0};
+    std::atomic<int> g_recorded_strokes_server_batch_count{0};
+    std::atomic<int> g_recorded_strokes_queue_count{0};
+    std::atomic<int> g_recorded_strokes_native_count{0};
+    std::atomic<int> g_recorded_strokes_events_observed{0};
+    std::atomic<int> g_recorded_strokes_events_ignored_receiver{0};
+    std::atomic<int> g_recorded_strokes_layout_unavailable{0};
+    std::atomic<int> g_recorded_strokes_events_captured{0};
+    std::atomic<int> g_recorded_strokes_queue_duplicates{0};
+    // The local receiver is proven by identity, outer chain, owner chain, or the
+    // component set resolved from the acknowledged local body. These addresses
+    // are stored plainly because the detour only compares pointers, never
+    // dereferences the reflected properties from the hot path.
+    std::atomic<std::uintptr_t> g_recorded_strokes_local_pawn{0};
+    std::atomic<std::uintptr_t> g_recorded_strokes_local_controller{0};
+    std::atomic<std::uintptr_t> g_recorded_strokes_local_relay{0};
+    std::atomic<int> g_recorded_strokes_owner_offset{-1};
     // Runtime layout for PaintAtScreenPosition/PaintAtWorldPosition, resolved
     // once from UFunction reflection when recording starts. The game brush does
     // not pass BrushSettings; it uses the component's CurrentBrushSettings.
@@ -501,6 +524,16 @@ namespace
         g_recorded_strokes_world_position_count.store(0, std::memory_order_release);
         g_recorded_strokes_screen_position_empty.store(0, std::memory_order_release);
         g_recorded_strokes_ignored_receiver_count.store(0, std::memory_order_release);
+        g_recorded_strokes_uv_count.store(0, std::memory_order_release);
+        g_recorded_strokes_batch_count.store(0, std::memory_order_release);
+        g_recorded_strokes_server_batch_count.store(0, std::memory_order_release);
+        g_recorded_strokes_queue_count.store(0, std::memory_order_release);
+        g_recorded_strokes_native_count.store(0, std::memory_order_release);
+        g_recorded_strokes_events_observed.store(0, std::memory_order_release);
+        g_recorded_strokes_events_ignored_receiver.store(0, std::memory_order_release);
+        g_recorded_strokes_layout_unavailable.store(0, std::memory_order_release);
+        g_recorded_strokes_events_captured.store(0, std::memory_order_release);
+        g_recorded_strokes_queue_duplicates.store(0, std::memory_order_release);
     }
 
     auto recorded_strokes_capture_stroke(const sdk::FPaintStroke& stroke,
@@ -545,6 +578,50 @@ namespace
         }
     }
 
+    auto recorded_strokes_matches_local_identity(std::uintptr_t object) -> bool
+    {
+        if (!object)
+        {
+            return false;
+        }
+        const auto pawn = g_recorded_strokes_local_pawn.load(std::memory_order_acquire);
+        const auto controller =
+            g_recorded_strokes_local_controller.load(std::memory_order_acquire);
+        const auto relay = g_recorded_strokes_local_relay.load(std::memory_order_acquire);
+        if (object == pawn || object == controller || object == relay)
+        {
+            return true;
+        }
+        // The game can route the brush through an actor/component whose Outer
+        // chain, not its class, identifies the local body. The detour only
+        // compares addresses here so this is safe from the ProcessEvent path.
+        auto current = object;
+        for (int depth = 0; live_uobject(current) && depth < 12; ++depth)
+        {
+            if (current == pawn || current == controller || current == relay)
+            {
+                return true;
+            }
+            current = safe_read<std::uintptr_t>(current + OffOuter, 0);
+        }
+        const int owner_offset =
+            g_recorded_strokes_owner_offset.load(std::memory_order_acquire);
+        if (owner_offset >= 0)
+        {
+            current = safe_read<std::uintptr_t>(
+                object + static_cast<std::uintptr_t>(owner_offset), 0);
+            for (int depth = 0; live_uobject(current) && depth < 12; ++depth)
+            {
+                if (current == pawn || current == controller || current == relay)
+                {
+                    return true;
+                }
+                current = safe_read<std::uintptr_t>(current + OffOuter, 0);
+            }
+        }
+        return false;
+    }
+
     auto recorded_strokes_receiver_is_local(std::uintptr_t object) -> bool
     {
         if (!object)
@@ -555,14 +632,20 @@ namespace
         {
             return true;
         }
-        if (g_recorded_strokes_accept_any_receiver.load(std::memory_order_acquire))
+        if (recorded_strokes_matches_local_identity(object))
         {
             return true;
         }
-        std::lock_guard<std::mutex> lock(g_recorded_strokes_receivers_mutex);
-        return std::find(g_recorded_strokes_local_components.begin(),
-                         g_recorded_strokes_local_components.end(),
-                         object) != g_recorded_strokes_local_components.end();
+        {
+            std::lock_guard<std::mutex> lock(g_recorded_strokes_receivers_mutex);
+            if (std::find(g_recorded_strokes_local_components.begin(),
+                          g_recorded_strokes_local_components.end(),
+                          object) != g_recorded_strokes_local_components.end())
+            {
+                return true;
+            }
+        }
+        return g_recorded_strokes_accept_any_receiver.load(std::memory_order_acquire);
     }
 
     auto recorded_strokes_capture_paint_entry(std::uintptr_t object,
@@ -1407,7 +1490,7 @@ namespace
     }
 
     template <typename T>
-    auto safe_read(std::uintptr_t address, T fallback = T{}) -> T
+    auto safe_read(std::uintptr_t address, T fallback) -> T
     {
         __try
         {
@@ -25163,6 +25246,1238 @@ namespace
         return request.find("\"type\":\"replay_recorded_strokes\"") != std::string::npos;
     }
 
+    // =============================================================================
+    // Section: Paint-route discovery and global ProcessEvent capture
+    // Risk: high. The game's first-person brush does not necessarily call
+    // PaintAtUVWithBrush on the same object the app uses for direct transport.
+    // The recording path therefore installs a real MinHook detour on the
+    // verified UObject::ProcessEvent entry point(s), resolves every paint-related
+    // UFunction by reflection, captures single strokes and stroke batches by
+    // name/address plus local receiver, and keeps a discovery log that explains a
+    // zero-stroke recording. The app's explicit PaintAtUVWithBrush capture is
+    // unchanged and replay suppression still guards both routes.
+    // =============================================================================
+
+    enum class RecordedPaintKind : int
+    {
+        Unknown = 0,
+        UvWithBrush,
+        ScreenPosition,
+        WorldPosition,
+        Uv,
+        StrokeBatch,
+    };
+
+    struct RecordedPaintFunctionSpec
+    {
+        std::uintptr_t function{0};
+        std::string name{};
+        RecordedPaintKind kind{RecordedPaintKind::Unknown};
+        int params_size{0};
+        int uv_offset{-1};
+        int screen_offset{-1};
+        int world_offset{-1};
+        int channel_data_offset{-1};
+        int channel_data_size{0};
+        int channel_offset{-1};
+        int brush_offset{-1};
+        int brush_size{0};
+        int return_offset{-1};
+        int return_size{0};
+        int strokes_offset{-1};
+        int strokes_element_size{0};
+        int stroke_struct_offset{-1};
+        int stroke_struct_size{0};
+        int paint_component_offset{-1};
+        bool local_sender{false};
+    };
+
+    struct RecordedDiscoveryEntry
+    {
+        std::uintptr_t function{0};
+        std::uintptr_t receiver{0};
+        std::string name{};
+        std::string receiver_class{};
+        std::string receiver_name{};
+        int kind{0};
+        int params_size{0};
+        bool local_receiver{false};
+        int calls{0};
+        std::uint64_t first_tick{0};
+        std::uint64_t last_tick{0};
+    };
+
+    std::mutex g_recorded_paint_functions_mutex;
+    std::unordered_map<std::uintptr_t, RecordedPaintFunctionSpec>
+        g_recorded_paint_functions{};
+
+    std::atomic<Reflection*> g_recorded_strokes_reflection{nullptr};
+
+    std::atomic<bool> g_stroke_discovery_active{false};
+    std::atomic<std::uint64_t> g_stroke_discovery_deadline_tick{0};
+    std::atomic<int> g_stroke_discovery_window_seconds{0};
+    std::atomic<int> g_stroke_discovery_process_event_calls{0};
+    std::atomic<int> g_stroke_discovery_paint_calls{0};
+    std::atomic<int> g_stroke_discovery_paint_ignored_receiver{0};
+    std::atomic<int> g_stroke_discovery_paint_layout_unavailable{0};
+    std::atomic<std::uintptr_t> g_stroke_discovery_last_function{0};
+    std::atomic<std::uintptr_t> g_stroke_discovery_last_receiver{0};
+    std::mutex g_stroke_discovery_mutex;
+    std::vector<RecordedDiscoveryEntry> g_stroke_discovery_entries{};
+    std::unordered_map<std::uintptr_t, std::string> g_process_event_function_names{};
+
+    std::mutex g_recorded_queue_mutex;
+    std::unordered_set<std::uint64_t> g_recorded_queue_seen{};
+    std::atomic<std::uintptr_t> g_recorded_queue_manager{0};
+    std::atomic<std::uint64_t> g_recorded_queue_last_sample_tick{0};
+    std::atomic<int> g_recorded_queue_batches_offset{-1};
+    std::atomic<int> g_recorded_queue_local_offset{-1};
+    std::atomic<int> g_recorded_queue_stroke_chunk_offset{-1};
+
+    constexpr int MaxGlobalProcessEventHooks = 4;
+    std::mutex g_global_process_event_hook_mutex;
+    std::atomic<bool> g_global_process_event_hook_installed{false};
+    std::atomic<std::uintptr_t> g_global_process_event_targets[MaxGlobalProcessEventHooks]{};
+    std::atomic<std::uintptr_t> g_global_process_event_originals[MaxGlobalProcessEventHooks]{};
+
+    auto recorded_paint_kind_name(RecordedPaintKind kind) -> const char*
+    {
+        switch (kind)
+        {
+        case RecordedPaintKind::UvWithBrush:
+            return "paint_at_uv_with_brush";
+        case RecordedPaintKind::ScreenPosition:
+            return "paint_at_screen_position";
+        case RecordedPaintKind::WorldPosition:
+            return "paint_at_world_position";
+        case RecordedPaintKind::Uv:
+            return "paint_at_uv";
+        case RecordedPaintKind::StrokeBatch:
+            return "stroke_batch";
+        case RecordedPaintKind::Unknown:
+        default:
+            return "unknown";
+        }
+    }
+
+    auto recorded_paint_candidate_names() -> const std::unordered_set<std::string>&
+    {
+        static const std::unordered_set<std::string> names{
+            "paintatuvwithbrush", "paintatscreenposition", "paintatworldposition",
+            "paintatuv", "paintstrokeuv", "paintstroke", "paintstrokebatch",
+            "beginpaint", "endpaint", "beginstroke", "endstroke",
+            "serverpaint", "serverpaintbatch", "serversendpaint", "serversendstrokebatch",
+            "serverrelaypaint", "serverrelaystrokebatch", "serverrelaypackedstrokebatch",
+            "serverrelaycompactstrokebatch", "servercompactpaint", "servercompactpaintbatch",
+            "serverpackedpaintbatch", "sendpainttoserver", "sendstrokebatchtoserver",
+            "sendcustomstrokebatchtoserver", "relaypainttoserver", "relaystrokebatchtoserver",
+            "requestpaintonserver", "requeststrokebatchonserver", "flushrecordedstrokestoserver",
+            "clearrecordedstrokes", "multicastpaint", "multicastpaintbatch",
+            "multicastpainttoothers", "multicastpaintbatchtoothers", "multicastcompactpaint",
+            "multicastcompactpaintbatch", "multicastcompactpaintbatchtoothers",
+            "multicastcompactpainttoothers", "multicastpackedpaintbatch",
+            "multicastpackedpaintbatchtoothers", "applypaintsnapshot",
+            "applypaintsnapshottomesh", "capturepaintsnapshotfromsource",
+        };
+        return names;
+    }
+
+    auto recorded_paint_function_is_candidate(const std::string& lower_name) -> bool
+    {
+        if (recorded_paint_candidate_names().find(lower_name) !=
+            recorded_paint_candidate_names().end())
+        {
+            return true;
+        }
+        return lower_name.rfind("paintat", 0) == 0 ||
+               lower_name.rfind("serverpaint", 0) == 0 ||
+               lower_name.rfind("serverrelay", 0) == 0 ||
+               lower_name.rfind("serversend", 0) == 0 ||
+               lower_name.rfind("multicastpaint", 0) == 0 ||
+               lower_name.find("strokebatch") != std::string::npos;
+    }
+
+    auto recorded_paint_field_offset(Reflection& ref,
+                                     std::uintptr_t function,
+                                     std::initializer_list<const char*> names) -> int
+    {
+        const auto prop = find_property_any(ref, function, names);
+        return prop ? prop_offset(prop) : -1;
+    }
+
+    auto recorded_paint_function_spec(Reflection& ref,
+                                      std::uintptr_t function) -> RecordedPaintFunctionSpec
+    {
+        RecordedPaintFunctionSpec spec{};
+        spec.function = function;
+        spec.name = lower_copy(ref.object_name(function));
+        spec.params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        spec.uv_offset = recorded_paint_field_offset(ref, function, {"Uv", "UV", "PaintUV"});
+        spec.screen_offset = recorded_paint_field_offset(
+            ref, function, {"ScreenPosition", "ScreenPos"});
+        spec.world_offset = recorded_paint_field_offset(
+            ref, function, {"WorldPosition", "WorldPos", "Location"});
+        if (const auto prop = find_property_any(
+                ref, function, {"ChannelData", "PaintChannelData"}))
+        {
+            spec.channel_data_offset = prop_offset(prop);
+            spec.channel_data_size = prop_element_size(prop);
+        }
+        const auto channel_prop =
+            find_property_any(ref, function, {"Channel", "TargetChannel"});
+        if (channel_prop)
+        {
+            spec.channel_offset = prop_offset(channel_prop);
+        }
+        if (const auto prop = find_property_any(
+                ref, function, {"BrushSettings", "RuntimeBrushSettings", "Brush"}))
+        {
+            spec.brush_offset = prop_offset(prop);
+            spec.brush_size = prop_element_size(prop);
+        }
+        if (const auto prop = find_property_any(ref, function, {"ReturnValue"}))
+        {
+            spec.return_offset = prop_offset(prop);
+            spec.return_size = prop_element_size(prop);
+        }
+        if (const auto prop = find_property_any(
+                ref, function, {"PaintComponent", "SourcePaintComponent", "Component"}))
+        {
+            spec.paint_component_offset = prop_offset(prop);
+        }
+        if (const auto prop = find_property_any(ref, function, {"Strokes", "PaintStrokes"}))
+        {
+            spec.strokes_offset = prop_offset(prop);
+            spec.strokes_element_size = prop_element_size(prop);
+        }
+        else if (const auto batch_prop = find_property_any(
+                     ref, function,
+                     {"StrokeBatch", "PaintStrokeBatch", "CompactPaintStrokeBatch",
+                      "Batch", "PaintBatch"}))
+        {
+            const auto batch_struct = struct_type(
+                ref, batch_prop, {"Strokes", "PaintStrokes"});
+            if (batch_struct)
+            {
+                if (const auto strokes_prop = find_property_any(
+                        ref, batch_struct, {"Strokes", "PaintStrokes"}))
+                {
+                    spec.strokes_offset = prop_offset(batch_prop) + prop_offset(strokes_prop);
+                    spec.strokes_element_size = prop_element_size(strokes_prop);
+                }
+            }
+        }
+        if (const auto stroke_prop = find_property_any(
+                ref, function, {"Stroke", "PaintStroke", "StrokeData"}))
+        {
+            const auto stroke_struct = struct_type(
+                ref, stroke_prop, {"Uv", "UV", "BrushSettings", "ChannelData"});
+            if (stroke_struct)
+            {
+                spec.stroke_struct_offset = prop_offset(stroke_prop);
+                spec.stroke_struct_size = prop_element_size(stroke_prop);
+            }
+        }
+        const auto name = spec.name;
+        spec.local_sender = name.rfind("server", 0) == 0 ||
+                            name.rfind("send", 0) == 0 ||
+                            name.rfind("relay", 0) == 0 ||
+                            name.rfind("request", 0) == 0 ||
+                            name.rfind("flush", 0) == 0 ||
+                            name.find("toserver") != std::string::npos;
+        if (spec.stroke_struct_offset >= 0 &&
+            spec.stroke_struct_size >= static_cast<int>(sizeof(sdk::FPaintStroke)))
+        {
+            spec.kind = RecordedPaintKind::Uv;
+        }
+        else if (spec.strokes_offset >= 0)
+        {
+            spec.kind = RecordedPaintKind::StrokeBatch;
+        }
+        else if (spec.screen_offset >= 0 && spec.return_offset >= 0)
+        {
+            spec.kind = RecordedPaintKind::ScreenPosition;
+        }
+        else if (spec.world_offset >= 0 && spec.channel_data_offset >= 0)
+        {
+            spec.kind = RecordedPaintKind::WorldPosition;
+        }
+        else if (spec.uv_offset >= 0 && spec.channel_data_offset >= 0 &&
+                 spec.brush_offset >= 0)
+        {
+            spec.kind = RecordedPaintKind::UvWithBrush;
+        }
+        else if (spec.uv_offset >= 0 && spec.channel_data_offset >= 0)
+        {
+            spec.kind = RecordedPaintKind::Uv;
+        }
+        return spec;
+    }
+
+    auto recorded_paint_functions_refresh(Reflection& ref) -> int
+    {
+        std::unordered_map<std::uintptr_t, RecordedPaintFunctionSpec> functions{};
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!live_uobject(object) ||
+                lower_copy(ref.class_name(object)) != "function")
+            {
+                return false;
+            }
+            const auto lower_name = lower_copy(ref.object_name(object));
+            if (!recorded_paint_function_is_candidate(lower_name))
+            {
+                return false;
+            }
+            auto spec = recorded_paint_function_spec(ref, object);
+            if (spec.kind == RecordedPaintKind::Unknown && !spec.local_sender)
+            {
+                return false;
+            }
+            functions[object] = std::move(spec);
+            return false;
+        });
+        {
+            std::lock_guard<std::mutex> lock(g_recorded_paint_functions_mutex);
+            g_recorded_paint_functions = std::move(functions);
+        }
+        return static_cast<int>(g_recorded_paint_functions.size());
+    }
+
+    auto recorded_paint_function_lookup(std::uintptr_t function,
+                                        RecordedPaintFunctionSpec& spec) -> bool
+    {
+        std::lock_guard<std::mutex> lock(g_recorded_paint_functions_mutex);
+        const auto found = g_recorded_paint_functions.find(function);
+        if (found == g_recorded_paint_functions.end())
+        {
+            return false;
+        }
+        spec = found->second;
+        return true;
+    }
+
+    auto recorded_strokes_discovery_reset() -> void
+    {
+        g_stroke_discovery_active.store(false, std::memory_order_release);
+        g_stroke_discovery_deadline_tick.store(0, std::memory_order_release);
+        g_stroke_discovery_window_seconds.store(0, std::memory_order_release);
+        g_stroke_discovery_process_event_calls.store(0, std::memory_order_release);
+        g_stroke_discovery_paint_calls.store(0, std::memory_order_release);
+        g_stroke_discovery_paint_ignored_receiver.store(0, std::memory_order_release);
+        g_stroke_discovery_paint_layout_unavailable.store(0, std::memory_order_release);
+        g_stroke_discovery_last_function.store(0, std::memory_order_release);
+        g_stroke_discovery_last_receiver.store(0, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(g_stroke_discovery_mutex);
+        g_stroke_discovery_entries.clear();
+    }
+
+    auto recorded_strokes_discovery_start(int seconds) -> void
+    {
+        recorded_strokes_discovery_reset();
+        if (seconds <= 0)
+        {
+            return;
+        }
+        g_stroke_discovery_window_seconds.store(seconds, std::memory_order_release);
+        g_stroke_discovery_deadline_tick.store(
+            GetTickCount64() + static_cast<std::uint64_t>(seconds) * 1000ULL,
+            std::memory_order_release);
+        g_stroke_discovery_active.store(true, std::memory_order_release);
+    }
+
+    auto recorded_strokes_discovery_record(std::uintptr_t object,
+                                           std::uintptr_t function,
+                                           int params_size,
+                                           RecordedPaintKind kind,
+                                           bool has_spec) -> void
+    {
+        if (!g_stroke_discovery_active.load(std::memory_order_acquire))
+        {
+            return;
+        }
+        const auto now = GetTickCount64();
+        if (now > g_stroke_discovery_deadline_tick.load(std::memory_order_acquire))
+        {
+            g_stroke_discovery_active.store(false, std::memory_order_release);
+            return;
+        }
+        g_stroke_discovery_process_event_calls.fetch_add(1, std::memory_order_relaxed);
+        auto* ref = g_recorded_strokes_reflection.load(std::memory_order_acquire);
+        if (!ref || !function)
+        {
+            return;
+        }
+        std::string function_name{};
+        {
+            std::lock_guard<std::mutex> lock(g_stroke_discovery_mutex);
+            const auto cached = g_process_event_function_names.find(function);
+            if (cached != g_process_event_function_names.end())
+            {
+                function_name = cached->second;
+            }
+            else
+            {
+                function_name = ref->object_name(function);
+                if (g_process_event_function_names.size() < 16384)
+                {
+                    g_process_event_function_names.emplace(function, function_name);
+                }
+            }
+        }
+        const auto lower_name = lower_copy(function_name);
+        const bool paint_like =
+            has_spec || contains_text(lower_name, "paint") ||
+            contains_text(lower_name, "stroke") || contains_text(lower_name, "brush");
+        if (!paint_like)
+        {
+            return;
+        }
+        g_stroke_discovery_paint_calls.fetch_add(1, std::memory_order_relaxed);
+        g_stroke_discovery_last_function.store(function, std::memory_order_release);
+        g_stroke_discovery_last_receiver.store(object, std::memory_order_release);
+        const bool local_receiver = recorded_strokes_receiver_is_local(object);
+        if (!local_receiver)
+        {
+            g_stroke_discovery_paint_ignored_receiver.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!has_spec)
+        {
+            g_stroke_discovery_paint_layout_unavailable.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::lock_guard<std::mutex> lock(g_stroke_discovery_mutex);
+        for (auto& entry : g_stroke_discovery_entries)
+        {
+            if (entry.function == function && entry.receiver == object)
+            {
+                ++entry.calls;
+                entry.last_tick = now;
+                return;
+            }
+        }
+        if (g_stroke_discovery_entries.size() >= 192)
+        {
+            return;
+        }
+        RecordedDiscoveryEntry entry{};
+        entry.function = function;
+        entry.receiver = object;
+        entry.name = function_name;
+        entry.receiver_class = ref->class_name(object);
+        entry.receiver_name = ref->object_name(object);
+        entry.kind = static_cast<int>(kind);
+        entry.params_size = params_size;
+        entry.local_receiver = local_receiver;
+        entry.calls = 1;
+        entry.first_tick = now;
+        entry.last_tick = now;
+        g_stroke_discovery_entries.push_back(std::move(entry));
+    }
+
+    auto recorded_paint_function_lookup_count() -> int;
+
+    auto recorded_strokes_discovery_metadata() -> std::string
+    {
+        std::string out = ",\"discovery_active\":" +
+                          std::string(json_bool(g_stroke_discovery_active.load(
+                              std::memory_order_acquire)));
+        out += ",\"discovery_window_seconds\":" +
+               std::to_string(g_stroke_discovery_window_seconds.load(
+                   std::memory_order_acquire));
+        out += ",\"discovery_process_event_calls\":" +
+               std::to_string(g_stroke_discovery_process_event_calls.load(
+                   std::memory_order_acquire));
+        out += ",\"discovery_paint_calls\":" +
+               std::to_string(g_stroke_discovery_paint_calls.load(
+                   std::memory_order_acquire));
+        out += ",\"discovery_paint_ignored_receiver\":" +
+               std::to_string(g_stroke_discovery_paint_ignored_receiver.load(
+                   std::memory_order_acquire));
+        out += ",\"discovery_paint_layout_unavailable\":" +
+               std::to_string(g_stroke_discovery_paint_layout_unavailable.load(
+                   std::memory_order_acquire));
+        out += ",\"discovery_last_function\":\"" +
+               hex_address(g_stroke_discovery_last_function.load(
+                   std::memory_order_acquire)) + "\"";
+        out += ",\"discovery_last_receiver\":\"" +
+               hex_address(g_stroke_discovery_last_receiver.load(
+                   std::memory_order_acquire)) + "\"";
+        out += ",\"discovered_paint_functions\":[";
+        {
+            std::lock_guard<std::mutex> lock(g_stroke_discovery_mutex);
+            bool first = true;
+            std::size_t emitted = 0;
+            for (const auto& entry : g_stroke_discovery_entries)
+            {
+                if (emitted >= 96)
+                {
+                    break;
+                }
+                if (!first)
+                {
+                    out += ",";
+                }
+                first = false;
+                ++emitted;
+                out += "{\"function\":\"" + hex_address(entry.function) + "\"";
+                out += ",\"name\":\"" + json_escape(entry.name) + "\"";
+                out += ",\"receiver\":\"" + hex_address(entry.receiver) + "\"";
+                out += ",\"receiver_class\":\"" +
+                       json_escape(entry.receiver_class) + "\"";
+                out += ",\"receiver_name\":\"" +
+                       json_escape(entry.receiver_name) + "\"";
+                out += ",\"kind\":\"" +
+                       std::string(recorded_paint_kind_name(
+                           static_cast<RecordedPaintKind>(entry.kind))) + "\"";
+                out += ",\"params_size\":" + std::to_string(entry.params_size);
+                out += ",\"local_receiver\":" +
+                       std::string(json_bool(entry.local_receiver));
+                out += ",\"calls\":" + std::to_string(entry.calls) + "}";
+            }
+        }
+        out += "]";
+        out += ",\"paint_function_count\":" +
+               std::to_string(recorded_paint_function_lookup_count());
+        return out;
+    }
+
+    auto recorded_paint_function_lookup_count() -> int
+    {
+        std::lock_guard<std::mutex> lock(g_recorded_paint_functions_mutex);
+        return static_cast<int>(g_recorded_paint_functions.size());
+    }
+
+    struct RecordedPendingPaintCapture
+    {
+        bool valid{false};
+        RecordedPaintKind kind{RecordedPaintKind::Unknown};
+        sdk::FPaintStroke stroke{};
+        int return_offset{-1};
+        int return_size{0};
+        bool needs_return{false};
+    };
+
+    auto recorded_brush_at_component(std::uintptr_t object) -> sdk::FRuntimeBrushSettings
+    {
+        sdk::FRuntimeBrushSettings brush{};
+        const int offset =
+            g_recorded_strokes_current_brush_offset.load(std::memory_order_acquire);
+        const int size =
+            g_recorded_strokes_current_brush_size.load(std::memory_order_acquire);
+        if (object && offset >= 0 && size >= static_cast<int>(sizeof(brush)))
+        {
+            if (safe_copy(&brush,
+                          reinterpret_cast<const void*>(
+                              object + static_cast<std::uintptr_t>(offset)),
+                          sizeof(brush)))
+            {
+                return brush;
+            }
+        }
+        return brush;
+    }
+
+    auto recorded_strokes_read_channel_data(std::uint8_t* params,
+                                            const RecordedPaintFunctionSpec& spec,
+                                            sdk::FPaintChannelData& data) -> bool
+    {
+        if (!params || spec.channel_data_offset < 0 ||
+            spec.channel_data_size < static_cast<int>(sizeof(data)))
+        {
+            return false;
+        }
+        return safe_copy(&data,
+                         params + static_cast<std::uintptr_t>(spec.channel_data_offset),
+                         sizeof(data));
+    }
+
+    auto recorded_strokes_read_channel(std::uint8_t* params,
+                                       const RecordedPaintFunctionSpec& spec) -> int
+    {
+        if (!params || spec.channel_offset < 0)
+        {
+            return static_cast<int>(sdk::EPaintChannel::Albedo);
+        }
+        const auto channel = safe_read<std::uint8_t>(
+            reinterpret_cast<std::uintptr_t>(params) +
+                static_cast<std::uintptr_t>(spec.channel_offset),
+            0);
+        return std::clamp(static_cast<int>(channel),
+                          0,
+                          static_cast<int>(sdk::EPaintChannel::Max) - 1);
+    }
+
+    auto recorded_strokes_capture_spec_before(std::uintptr_t object,
+                                              std::uint8_t* params,
+                                              const RecordedPaintFunctionSpec& spec,
+                                              RecordedPendingPaintCapture& pending) -> void
+    {
+        if (!params || spec.kind == RecordedPaintKind::Unknown)
+        {
+            return;
+        }
+        if (spec.kind == RecordedPaintKind::UvWithBrush &&
+            spec.params_size ==
+                static_cast<int>(sizeof(sdk::RuntimePaintableComponent_PaintAtUVWithBrush)))
+        {
+            recorded_strokes_capture(
+                *reinterpret_cast<const sdk::RuntimePaintableComponent_PaintAtUVWithBrush*>(
+                    params));
+            g_recorded_strokes_uv_count.fetch_add(1, std::memory_order_relaxed);
+            g_recorded_strokes_events_captured.fetch_add(1, std::memory_order_relaxed);
+            g_recorded_strokes_native_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (spec.kind == RecordedPaintKind::StrokeBatch && spec.strokes_offset >= 0)
+        {
+            const auto* array = reinterpret_cast<const sdk::TArray<std::uint8_t>*>(
+                params + static_cast<std::uintptr_t>(spec.strokes_offset));
+            const int num = array ? array->Num : -1;
+            const int max = array ? array->Max : -1;
+            const auto* data = array ? array->Data : nullptr;
+            if (num <= 0 || num > 1000000 || max < num || !data)
+            {
+                return;
+            }
+            const int element_size = spec.strokes_element_size > 0
+                                         ? spec.strokes_element_size
+                                         : static_cast<int>(sizeof(sdk::FPaintStroke));
+            if (element_size != static_cast<int>(sizeof(sdk::FPaintStroke)))
+            {
+                g_recorded_strokes_layout_unavailable.fetch_add(
+                    1, std::memory_order_relaxed);
+                return;
+            }
+            bool captured_any = false;
+            for (int index = 0; index < num; ++index)
+            {
+                sdk::FPaintStroke stroke{};
+                if (!safe_copy(&stroke,
+                               data + static_cast<std::uintptr_t>(index) *
+                                          static_cast<std::uintptr_t>(element_size),
+                               sizeof(stroke)))
+                {
+                    continue;
+                }
+                if (recorded_strokes_capture_stroke(stroke, "stroke_batch"))
+                {
+                    captured_any = true;
+                }
+            }
+            if (captured_any)
+            {
+                g_recorded_strokes_batch_count.fetch_add(1, std::memory_order_relaxed);
+                g_recorded_strokes_events_captured.fetch_add(1, std::memory_order_relaxed);
+                if (spec.local_sender)
+                {
+                    g_recorded_strokes_server_batch_count.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+        sdk::FPaintStroke stroke{};
+        stroke.BrushSettings = recorded_brush_at_component(object);
+        if (spec.brush_offset >= 0 && spec.brush_size >=
+                                         static_cast<int>(sizeof(stroke.BrushSettings)))
+        {
+            safe_copy(&stroke.BrushSettings,
+                      params + static_cast<std::uintptr_t>(spec.brush_offset),
+                      sizeof(stroke.BrushSettings));
+        }
+        if (spec.stroke_struct_offset >= 0 && spec.stroke_struct_size > 0)
+        {
+            safe_copy(&stroke,
+                      params + static_cast<std::uintptr_t>(spec.stroke_struct_offset),
+                      static_cast<std::size_t>(std::min(
+                          spec.stroke_struct_size,
+                          static_cast<int>(sizeof(stroke)))));
+            if (recorded_strokes_capture_stroke(stroke, "paint_stroke_struct"))
+            {
+                g_recorded_strokes_events_captured.fetch_add(
+                    1, std::memory_order_relaxed);
+                g_recorded_strokes_native_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        recorded_strokes_read_channel_data(params, spec, stroke.ChannelData);
+        stroke.TargetChannel =
+            static_cast<sdk::EPaintChannel>(recorded_strokes_read_channel(params, spec));
+        if (spec.uv_offset >= 0)
+        {
+            sdk::FVector2D uv{};
+            if (safe_copy(&uv,
+                          params + static_cast<std::uintptr_t>(spec.uv_offset),
+                          sizeof(uv)))
+            {
+                stroke.Uv = uv;
+            }
+        }
+        if (spec.world_offset >= 0)
+        {
+            sdk::FVector world{};
+            if (safe_copy(&world,
+                          params + static_cast<std::uintptr_t>(spec.world_offset),
+                          sizeof(world)))
+            {
+                stroke.WorldPosition = world;
+                stroke.bHasWorldPosition = true;
+            }
+        }
+        if (spec.kind == RecordedPaintKind::ScreenPosition ||
+            spec.kind == RecordedPaintKind::WorldPosition ||
+            (spec.return_offset >= 0 &&
+             spec.return_size >=
+                 static_cast<int>(sizeof(sdk::FScreenSpacePaintResult))))
+        {
+            pending.valid = true;
+            pending.kind = spec.kind;
+            pending.stroke = stroke;
+            pending.return_offset = spec.return_offset;
+            pending.return_size = spec.return_size;
+            pending.needs_return = spec.return_offset >= 0 &&
+                                   spec.return_size >=
+                                       static_cast<int>(sizeof(sdk::FScreenSpacePaintResult));
+            if (!pending.needs_return)
+            {
+                if (recorded_strokes_capture_stroke(
+                        stroke, recorded_paint_kind_name(spec.kind)))
+                {
+                    g_recorded_strokes_events_captured.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (spec.kind == RecordedPaintKind::WorldPosition)
+                    {
+                        g_recorded_strokes_world_position_count.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        g_recorded_strokes_native_count.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                }
+                pending.valid = false;
+            }
+            return;
+        }
+        if (recorded_strokes_capture_stroke(
+                stroke, recorded_paint_kind_name(spec.kind)))
+        {
+            g_recorded_strokes_events_captured.fetch_add(1, std::memory_order_relaxed);
+            if (spec.kind == RecordedPaintKind::ScreenPosition)
+            {
+                g_recorded_strokes_screen_position_count.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            else if (spec.kind == RecordedPaintKind::WorldPosition)
+            {
+                g_recorded_strokes_world_position_count.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_recorded_strokes_native_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    auto recorded_strokes_capture_spec_after(std::uint8_t* params,
+                                             const RecordedPaintFunctionSpec& spec,
+                                             RecordedPendingPaintCapture& pending) -> void
+    {
+        if (!pending.valid || !pending.needs_return || !params)
+        {
+            if (pending.valid && pending.needs_return)
+            {
+                g_recorded_strokes_screen_position_empty.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        sdk::FScreenSpacePaintResult result{};
+        if (!safe_copy(&result,
+                       params + static_cast<std::uintptr_t>(pending.return_offset),
+                       sizeof(result)) ||
+            !result.bSuccess || !std::isfinite(result.HitUV.X) ||
+            !std::isfinite(result.HitUV.Y))
+        {
+            g_recorded_strokes_screen_position_empty.fetch_add(
+                1, std::memory_order_relaxed);
+            return;
+        }
+        pending.stroke.Uv = result.HitUV;
+        pending.stroke.WorldPosition = result.HitWorldPosition;
+        pending.stroke.bHasWorldPosition = true;
+        if (recorded_strokes_capture_stroke(
+                pending.stroke, recorded_paint_kind_name(pending.kind)))
+        {
+            g_recorded_strokes_events_captured.fetch_add(1, std::memory_order_relaxed);
+            if (pending.kind == RecordedPaintKind::ScreenPosition)
+            {
+                g_recorded_strokes_screen_position_count.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_recorded_strokes_world_position_count.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+        (void)spec;
+    }
+
+    auto recorded_stroke_hash(const sdk::FPaintStroke& stroke) -> std::uint64_t
+    {
+        auto mix = [](std::uint64_t& hash, const void* data, std::size_t size) {
+            const auto* bytes = static_cast<const std::uint8_t*>(data);
+            for (std::size_t index = 0; index < size; ++index)
+            {
+                hash ^= bytes[index];
+                hash *= 1099511628211ULL;
+            }
+        };
+        std::uint64_t hash = 1469598103934665603ULL;
+        const auto source = stroke.ReplicationSourceId;
+        if ((source.A | source.B | source.C | source.D) != 0)
+        {
+            mix(hash, &stroke.ReplicationSourceId, sizeof(stroke.ReplicationSourceId));
+        }
+        else
+        {
+            mix(hash, &stroke.Uv, sizeof(stroke.Uv));
+            mix(hash, &stroke.WorldPosition, sizeof(stroke.WorldPosition));
+            mix(hash, &stroke.BrushSettings, sizeof(stroke.BrushSettings));
+            mix(hash, &stroke.ChannelData, sizeof(stroke.ChannelData));
+            mix(hash, &stroke.TargetChannel, sizeof(stroke.TargetChannel));
+        }
+        return hash;
+    }
+
+    auto recorded_strokes_capture_queue(Reflection& ref, const char* source) -> int
+    {
+        auto manager = g_recorded_queue_manager.load(std::memory_order_acquire);
+        if (!live_uobject(manager))
+        {
+            manager = ref.find_first_instance("RuntimePaintReplicationManager");
+            if (live_uobject(manager))
+            {
+                g_recorded_queue_manager.store(manager, std::memory_order_release);
+            }
+        }
+        if (!live_uobject(manager))
+        {
+            return 0;
+        }
+        if (g_recorded_queue_local_offset.load(std::memory_order_acquire) < 0)
+        {
+            const auto local_prop =
+                ref.find_property(ref.class_ptr(manager), "QueuedLocalPaintBatches");
+            const auto batches_prop =
+                ref.find_property(ref.class_ptr(manager), "QueuedBatches");
+            const auto chunk_prop =
+                ref.find_property(ref.class_ptr(manager), "StrokeChunkBuffer");
+            g_recorded_queue_local_offset.store(
+                local_prop ? prop_offset(local_prop) : 0x78,
+                std::memory_order_release);
+            g_recorded_queue_batches_offset.store(
+                batches_prop ? prop_offset(batches_prop) : 0x68,
+                std::memory_order_release);
+            g_recorded_queue_stroke_chunk_offset.store(
+                chunk_prop ? prop_offset(chunk_prop) : 0x98,
+                std::memory_order_release);
+        }
+        int captured = 0;
+        auto capture_stroke = [&](const sdk::FPaintStroke& stroke) {
+            const auto hash = recorded_stroke_hash(stroke);
+            {
+                std::lock_guard<std::mutex> lock(g_recorded_queue_mutex);
+                if (!g_recorded_queue_seen.insert(hash).second)
+                {
+                    g_recorded_strokes_queue_duplicates.fetch_add(
+                        1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+            if (recorded_strokes_capture_stroke(stroke, source))
+            {
+                ++captured;
+            }
+        };
+        auto capture_batch_array = [&](int array_offset, bool entries) {
+            if (array_offset < 0)
+            {
+                return;
+            }
+            const auto data = safe_read<std::uintptr_t>(
+                manager + static_cast<std::uintptr_t>(array_offset));
+            const int num = safe_read<int>(
+                manager + static_cast<std::uintptr_t>(array_offset) + 8, -1);
+            const int max = safe_read<int>(
+                manager + static_cast<std::uintptr_t>(array_offset) + 12, -1);
+            if (num <= 0 || num > 4096 || max < num || !data)
+            {
+                return;
+            }
+            if (!entries)
+            {
+                for (int index = 0; index < num; ++index)
+                {
+                    sdk::FPaintStroke stroke{};
+                    if (safe_copy(
+                            &stroke,
+                            reinterpret_cast<const void*>(
+                                data + static_cast<std::uintptr_t>(index) *
+                                           sizeof(sdk::FPaintStroke)),
+                            sizeof(stroke)))
+                    {
+                        capture_stroke(stroke);
+                    }
+                }
+                return;
+            }
+            for (int index = 0; index < num; ++index)
+            {
+                const auto entry = data + static_cast<std::uintptr_t>(index) * 0x28;
+                const auto strokes_data = safe_read<std::uintptr_t>(entry + 0x8);
+                const int strokes_num = safe_read<int>(entry + 0x10, -1);
+                const int strokes_max = safe_read<int>(entry + 0x14, -1);
+                if (strokes_num <= 0 || strokes_num > 1000000 ||
+                    strokes_max < strokes_num || !strokes_data)
+                {
+                    continue;
+                }
+                for (int stroke_index = 0; stroke_index < strokes_num; ++stroke_index)
+                {
+                    sdk::FPaintStroke stroke{};
+                    if (safe_copy(
+                            &stroke,
+                            reinterpret_cast<const void*>(
+                                strokes_data +
+                                static_cast<std::uintptr_t>(stroke_index) *
+                                    sizeof(sdk::FPaintStroke)),
+                            sizeof(stroke)))
+                    {
+                        capture_stroke(stroke);
+                    }
+                }
+            }
+        };
+        capture_batch_array(
+            g_recorded_queue_local_offset.load(std::memory_order_acquire), true);
+        capture_batch_array(
+            g_recorded_queue_stroke_chunk_offset.load(std::memory_order_acquire), false);
+        if (captured > 0)
+        {
+            g_recorded_strokes_queue_count.fetch_add(captured, std::memory_order_relaxed);
+            g_recorded_strokes_events_captured.fetch_add(captured, std::memory_order_relaxed);
+            recorded_strokes_add_source("recorded_stroke_queue");
+        }
+        return captured;
+    }
+
+    auto recorded_strokes_capture_queue_guarded(Reflection& ref,
+                                                const char* source) -> int;
+
+    auto recorded_strokes_queue_reset() -> void
+    {
+        g_recorded_queue_last_sample_tick.store(0, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(g_recorded_queue_mutex);
+        g_recorded_queue_seen.clear();
+    }
+
+    auto recorded_strokes_maybe_capture_queue() -> void
+    {
+        if (!g_recorded_strokes_active.load(std::memory_order_acquire) ||
+            g_recorded_strokes_suppress.load(std::memory_order_acquire) > 0)
+        {
+            return;
+        }
+        // Queue sampling is the fallback for a game build that paints through a
+        // direct native call and therefore never emits a paint UFunction. Once
+        // any reflected paint entry point has been observed, keep the exact call
+        // data and avoid mixing in the drained queue.
+        if (g_recorded_strokes_events_observed.load(std::memory_order_acquire) > 0)
+        {
+            return;
+        }
+        const auto now = GetTickCount64();
+        auto last = g_recorded_queue_last_sample_tick.load(std::memory_order_acquire);
+        if (last != 0 && now >= last && now - last < 100)
+        {
+            return;
+        }
+        if (!g_recorded_queue_last_sample_tick.compare_exchange_strong(
+                last,
+                now,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+        {
+            return;
+        }
+        if (auto* ref = g_recorded_strokes_reflection.load(
+                std::memory_order_acquire))
+        {
+            recorded_strokes_capture_queue_guarded(*ref, "recorded_stroke_queue");
+        }
+    }
+
+    auto recorded_strokes_capture_spec_before_guarded(
+        std::uintptr_t object,
+        std::uint8_t* params,
+        const RecordedPaintFunctionSpec& spec,
+        RecordedPendingPaintCapture& pending) -> void
+    {
+        __try
+        {
+            recorded_strokes_capture_spec_before(object, params, spec, pending);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    auto recorded_strokes_capture_spec_after_guarded(
+        std::uint8_t* params,
+        const RecordedPaintFunctionSpec& spec,
+        RecordedPendingPaintCapture& pending) -> void
+    {
+        __try
+        {
+            recorded_strokes_capture_spec_after(params, spec, pending);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    auto recorded_strokes_capture_queue_guarded(Reflection& ref,
+                                                const char* source) -> int
+    {
+        __try
+        {
+            return recorded_strokes_capture_queue(ref, source);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    auto recorded_strokes_capture_spec_call(std::uintptr_t object,
+                                            std::uintptr_t function,
+                                            std::uint8_t* params,
+                                            std::uintptr_t original) -> void
+    {
+        RecordedPaintFunctionSpec spec{};
+        const bool has_spec =
+            function && recorded_paint_function_lookup(function, spec);
+        const bool recording =
+            g_recorded_strokes_active.load(std::memory_order_acquire) &&
+            g_recorded_strokes_suppress.load(std::memory_order_acquire) == 0;
+        RecordedPendingPaintCapture pending{};
+        const bool local_receiver =
+            has_spec && (!object || recorded_strokes_receiver_is_local(object));
+        if (has_spec)
+        {
+            g_recorded_strokes_events_observed.fetch_add(1, std::memory_order_relaxed);
+            if (!local_receiver && !spec.local_sender)
+            {
+                g_recorded_strokes_events_ignored_receiver.fetch_add(
+                    1, std::memory_order_relaxed);
+                g_recorded_strokes_ignored_receiver_count.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            else if (recording && params)
+            {
+                recorded_strokes_capture_spec_before_guarded(
+                    object, params, spec, pending);
+            }
+        }
+        if (original)
+        {
+            reinterpret_cast<ProcessEventFn>(original)(
+                reinterpret_cast<void*>(object),
+                reinterpret_cast<void*>(function),
+                params);
+        }
+        if (has_spec && recording && params)
+        {
+            recorded_strokes_capture_spec_after_guarded(params, spec, pending);
+        }
+    }
+
+    template <int Index>
+    void __fastcall global_hooked_process_event(void* object, void* function, void* params)
+    {
+        const auto original =
+            g_global_process_event_originals[Index].load(std::memory_order_acquire);
+        const auto function_address = reinterpret_cast<std::uintptr_t>(function);
+        if (function && params)
+        {
+            RecordedPaintFunctionSpec spec{};
+            const bool has_spec = recorded_paint_function_lookup(
+                function_address, spec);
+            if (g_stroke_discovery_active.load(std::memory_order_acquire) ||
+                has_spec)
+            {
+                recorded_strokes_discovery_record(
+                    reinterpret_cast<std::uintptr_t>(object),
+                    function_address,
+                    has_spec ? spec.params_size
+                             : safe_read<int>(function_address + OffPropertiesSize, 0),
+                    spec.kind,
+                    has_spec);
+            }
+        }
+        recorded_strokes_capture_spec_call(
+            reinterpret_cast<std::uintptr_t>(object),
+            function_address,
+            reinterpret_cast<std::uint8_t*>(params),
+            original);
+        recorded_strokes_maybe_capture_queue();
+    }
+
+    using GlobalProcessEventThunk = void(__fastcall*)(void*, void*, void*);
+    const GlobalProcessEventThunk g_global_process_event_thunks[MaxGlobalProcessEventHooks]{
+        &global_hooked_process_event<0>,
+        &global_hooked_process_event<1>,
+        &global_hooked_process_event<2>,
+        &global_hooked_process_event<3>,
+    };
+
+    auto recorded_strokes_install_global_process_event_hook(Reflection& ref) -> bool
+    {
+        std::lock_guard<std::mutex> hook_lock(g_global_process_event_hook_mutex);
+        if (g_global_process_event_hook_installed.load(std::memory_order_acquire))
+        {
+            return true;
+        }
+        std::vector<std::uintptr_t> targets{};
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!live_uobject(object))
+            {
+                return false;
+            }
+            const auto vtable = safe_read<std::uintptr_t>(object);
+            if (!vtable)
+            {
+                return false;
+            }
+            const auto slot = vtable + static_cast<std::uintptr_t>(
+                                          ProcessEventVtableIndex) * sizeof(std::uintptr_t);
+            const auto target = safe_read<std::uintptr_t>(slot);
+            if (!target || target == reinterpret_cast<std::uintptr_t>(
+                                        &hooked_process_event) ||
+                !trusted_process_event_target(target))
+            {
+                return false;
+            }
+            if (std::find(targets.begin(), targets.end(), target) == targets.end())
+            {
+                targets.push_back(target);
+            }
+            return targets.size() >= MaxGlobalProcessEventHooks;
+        });
+        if (targets.empty())
+        {
+            return false;
+        }
+        const auto init_status = MH_Initialize();
+        if (init_status != MH_OK && init_status != MH_ERROR_ALREADY_INITIALIZED)
+        {
+            return false;
+        }
+        int installed = 0;
+        for (const auto target : targets)
+        {
+            if (installed >= MaxGlobalProcessEventHooks)
+            {
+                break;
+            }
+            void* original = nullptr;
+            const auto status = MH_CreateHook(
+                reinterpret_cast<LPVOID>(target),
+                reinterpret_cast<LPVOID>(g_global_process_event_thunks[installed]),
+                &original);
+            if (status != MH_OK || !original)
+            {
+                continue;
+            }
+            if (MH_EnableHook(reinterpret_cast<LPVOID>(target)) != MH_OK)
+            {
+                (void)MH_RemoveHook(reinterpret_cast<LPVOID>(target));
+                continue;
+            }
+            g_global_process_event_targets[installed].store(
+                target, std::memory_order_release);
+            g_global_process_event_originals[installed].store(
+                reinterpret_cast<std::uintptr_t>(original),
+                std::memory_order_release);
+            ++installed;
+        }
+        if (installed == 0)
+        {
+            return false;
+        }
+        g_global_process_event_hook_installed.store(true, std::memory_order_release);
+        return true;
+    }
+
+    auto recorded_strokes_uninstall_global_process_event_hook() -> void
+    {
+        std::lock_guard<std::mutex> hook_lock(g_global_process_event_hook_mutex);
+        if (!g_global_process_event_hook_installed.exchange(
+                false, std::memory_order_acq_rel))
+        {
+            return;
+        }
+        for (int index = 0; index < MaxGlobalProcessEventHooks; ++index)
+        {
+            const auto target =
+                g_global_process_event_targets[index].exchange(
+                    0, std::memory_order_acq_rel);
+            if (target)
+            {
+                (void)MH_DisableHook(reinterpret_cast<LPVOID>(target));
+                (void)MH_RemoveHook(reinterpret_cast<LPVOID>(target));
+            }
+            g_global_process_event_originals[index].store(
+                0, std::memory_order_release);
+        }
+    }
+
+    auto recorded_strokes_zero_count_reason() -> std::string
+    {
+        if (g_recorded_strokes_count.load(std::memory_order_acquire) > 0)
+        {
+            return {};
+        }
+        if (recorded_paint_function_lookup_count() == 0)
+        {
+            return "no_paint_ufunctions_resolved";
+        }
+        if (g_stroke_discovery_paint_calls.load(std::memory_order_acquire) == 0 &&
+            g_recorded_strokes_events_observed.load(std::memory_order_acquire) == 0)
+        {
+            return "no_paint_process_event_calls_observed";
+        }
+        if (g_recorded_strokes_events_ignored_receiver.load(
+                std::memory_order_acquire) > 0)
+        {
+            return "paint_calls_observed_on_nonlocal_receivers";
+        }
+        if (g_recorded_strokes_layout_unavailable.load(
+                std::memory_order_acquire) > 0)
+        {
+            return "paint_calls_observed_without_capture_layout";
+        }
+        if (g_stroke_discovery_paint_layout_unavailable.load(
+                std::memory_order_acquire) > 0)
+        {
+            return "paint_calls_observed_without_reflected_spec";
+        }
+        return "paint_events_observed_but_no_finite_strokes";
+    }
+
     auto recorded_stroke_metadata(const char* route) -> std::string
     {
         return "\"route\":\"" + std::string(route ? route : "stroke_recording") + "\"" +
@@ -25178,12 +26493,38 @@ namespace
                    std::to_string(g_recorded_strokes_screen_position_count.load(std::memory_order_acquire)) +
                ",\"captured_paint_at_world_position\":" +
                    std::to_string(g_recorded_strokes_world_position_count.load(std::memory_order_acquire)) +
-               ",\"screen_position_empty_returns\":" +
-                   std::to_string(g_recorded_strokes_screen_position_empty.load(std::memory_order_acquire)) +
-               ",\"ignored_nonlocal_receivers\":" +
-                   std::to_string(g_recorded_strokes_ignored_receiver_count.load(std::memory_order_acquire)) +
-               ",\"strokes_dropped\":" +
-                   std::to_string(g_recorded_strokes_dropped.load(std::memory_order_acquire));
+                ",\"screen_position_empty_returns\":" +
+                    std::to_string(g_recorded_strokes_screen_position_empty.load(std::memory_order_acquire)) +
+                ",\"ignored_nonlocal_receivers\":" +
+                    std::to_string(g_recorded_strokes_ignored_receiver_count.load(std::memory_order_acquire)) +
+                ",\"captured_paint_at_uv\":" +
+                    std::to_string(g_recorded_strokes_uv_count.load(std::memory_order_acquire)) +
+                ",\"captured_stroke_batches\":" +
+                    std::to_string(g_recorded_strokes_batch_count.load(std::memory_order_acquire)) +
+                ",\"captured_server_stroke_batches\":" +
+                    std::to_string(g_recorded_strokes_server_batch_count.load(std::memory_order_acquire)) +
+                ",\"captured_native_strokes\":" +
+                    std::to_string(g_recorded_strokes_native_count.load(std::memory_order_acquire)) +
+                ",\"captured_recorded_queue_strokes\":" +
+                    std::to_string(g_recorded_strokes_queue_count.load(std::memory_order_acquire)) +
+                ",\"recorded_queue_duplicates\":" +
+                    std::to_string(g_recorded_strokes_queue_duplicates.load(std::memory_order_acquire)) +
+                ",\"paint_events_observed\":" +
+                    std::to_string(g_recorded_strokes_events_observed.load(std::memory_order_acquire)) +
+                ",\"paint_events_captured\":" +
+                    std::to_string(g_recorded_strokes_events_captured.load(std::memory_order_acquire)) +
+                ",\"paint_events_ignored_receiver\":" +
+                    std::to_string(g_recorded_strokes_events_ignored_receiver.load(std::memory_order_acquire)) +
+                ",\"paint_events_layout_unavailable\":" +
+                    std::to_string(g_recorded_strokes_layout_unavailable.load(std::memory_order_acquire)) +
+                ",\"global_process_event_hook\":" +
+                    std::string(json_bool(g_global_process_event_hook_installed.load(
+                        std::memory_order_acquire))) +
+                ",\"zero_count_reason\":\"" +
+                    json_escape(recorded_strokes_zero_count_reason()) + "\"" +
+                ",\"strokes_dropped\":" +
+                    std::to_string(g_recorded_strokes_dropped.load(std::memory_order_acquire)) +
+                recorded_strokes_discovery_metadata();
     }
 
     auto recorded_strokes_snapshot() -> std::vector<sdk::FPaintStroke>
@@ -25379,6 +26720,32 @@ namespace
             current_brush_offset = -1;
         }
 
+        const int discovery_seconds = std::clamp(
+            json_int_field(request, "discovery_seconds", 30, 0, 300), 0, 300);
+        recorded_strokes_queue_reset();
+        const int resolved_paint_functions = recorded_paint_functions_refresh(ref);
+        auto* recording_reflection = new Reflection(ref);
+        if (auto* previous = g_recorded_strokes_reflection.exchange(
+                recording_reflection, std::memory_order_acq_rel))
+        {
+            delete previous;
+        }
+        g_recorded_strokes_local_pawn.store(ctx.pawn, std::memory_order_release);
+        g_recorded_strokes_local_controller.store(ctx.controller,
+                                                  std::memory_order_release);
+        g_recorded_strokes_local_relay.store(ctx.relay_component,
+                                             std::memory_order_release);
+        int owner_offset = ref.resolve_property_offset("ActorComponent", "OwnerPrivate");
+        if (owner_offset < 0)
+        {
+            owner_offset = ref.resolve_property_offset("ActorComponent", "Owner");
+        }
+        if (owner_offset < 0)
+        {
+            owner_offset = ref.resolve_property_offset("Actor", "Owner");
+        }
+        g_recorded_strokes_owner_offset.store(owner_offset, std::memory_order_release);
+
         // Install the ProcessEvent detour on every local RuntimePaintableComponent,
         // not only the single slot resolved for the app's transport. The game's
         // first-person brush object can be a different instance or subclass.
@@ -25429,7 +26796,16 @@ namespace
         if (g_recorded_strokes_active.load(std::memory_order_acquire))
         {
             recorded_strokes_release_hooks();
+            // release_hooks() clears the receiver set; restore the components
+            // resolved for this take before the new hooks become active.
+            std::lock_guard<std::mutex> lock(g_recorded_strokes_receivers_mutex);
+            g_recorded_strokes_local_components = local_components;
+            g_recorded_strokes_accept_any_receiver.store(
+                local_components.size() <= 1, std::memory_order_release);
         }
+        recorded_strokes_uninstall_global_process_event_hook();
+        const bool global_hook_installed =
+            recorded_strokes_install_global_process_event_hook(ref);
         std::vector<std::uintptr_t> owned_slots{};
         int hooked_components = 0;
         std::string last_hook_failure{};
@@ -25457,9 +26833,10 @@ namespace
                 owned_slots.push_back(recording_slot);
             }
         }
-        if (hooked_components == 0)
+        if (hooked_components == 0 && !global_hook_installed)
         {
             recorded_strokes_release_hooks();
+            recorded_strokes_uninstall_global_process_event_hook();
             return response_json(false,
                                  "stroke_recording_hook_failed",
                                  0,
@@ -25512,7 +26889,12 @@ namespace
                                                     std::memory_order_release);
         recorded_strokes_set_source(paint_stroke_recording::NativeSource);
         g_recorded_strokes_active.store(true, std::memory_order_release);
+        recorded_strokes_discovery_start(discovery_seconds);
         std::string metadata = recorded_stroke_metadata("start_stroke_recording");
+        (void)global_hook_installed;
+        metadata += ",\"resolved_paint_functions\":" +
+                    std::to_string(resolved_paint_functions);
+        metadata += ",\"discovery_seconds\":" + std::to_string(discovery_seconds);
         metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
         metadata += ",\"paint_function\":\"" + hex_address(ctx.local_paint_at_uv_function) + "\"";
         metadata += ",\"screen_position_function\":\"" + hex_address(screen_position_function) + "\"";
@@ -25542,8 +26924,25 @@ namespace
     auto stop_stroke_recording_on_game_thread() -> std::string
     {
         const bool was_active =
-            g_recorded_strokes_active.exchange(false, std::memory_order_acq_rel);
+            g_recorded_strokes_active.load(std::memory_order_acquire);
+        if (was_active)
+        {
+            if (auto* ref = g_recorded_strokes_reflection.load(
+                    std::memory_order_acquire))
+            {
+                recorded_strokes_capture_queue_guarded(
+                    *ref, "recorded_stroke_queue");
+            }
+        }
+        g_recorded_strokes_active.store(false, std::memory_order_release);
+        g_stroke_discovery_active.store(false, std::memory_order_release);
         recorded_strokes_release_hooks();
+        recorded_strokes_uninstall_global_process_event_hook();
+        if (auto* ref = g_recorded_strokes_reflection.exchange(
+                nullptr, std::memory_order_acq_rel))
+        {
+            delete ref;
+        }
         std::string metadata = recorded_stroke_metadata("stop_stroke_recording");
         metadata += ",\"was_active\":" + std::string(json_bool(was_active));
         metadata += ",\"recording_full_history_retained\":true";
@@ -25559,6 +26958,8 @@ namespace
     auto clear_stroke_recording_on_game_thread() -> std::string
     {
         recorded_strokes_clear();
+        recorded_strokes_discovery_reset();
+        recorded_strokes_queue_reset();
         return response_json(true,
                              "stroke_recording_cleared",
                              0,
@@ -31365,7 +32766,8 @@ namespace
                 const auto function_address = reinterpret_cast<std::uintptr_t>(function);
                 const auto params_bytes = reinterpret_cast<std::uint8_t*>(params);
                 auto_event_watch_record(reinterpret_cast<std::uintptr_t>(object), function_address, params_bytes);
-                if (g_recorded_strokes_active.load(std::memory_order_acquire) &&
+                if (!g_global_process_event_hook_installed.load(std::memory_order_acquire) &&
+                    g_recorded_strokes_active.load(std::memory_order_acquire) &&
                     function_address == g_recorded_strokes_function.load(std::memory_order_acquire) &&
                     reinterpret_cast<std::uintptr_t>(object) ==
                         g_recorded_strokes_component.load(std::memory_order_acquire) &&
@@ -31433,7 +32835,8 @@ namespace
         // into the params block, so the game's own brush stroke is captured only
         // after the original call has run. The app's PaintAtUVWithBrush path is
         // captured before the call above.
-        if (function && params &&
+        if (!g_global_process_event_hook_installed.load(std::memory_order_acquire) &&
+            function && params &&
             g_recorded_strokes_active.load(std::memory_order_acquire) &&
             g_recorded_strokes_suppress.load(std::memory_order_acquire) == 0)
         {
@@ -34415,7 +35818,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         const auto original = g_esp_execute_original.load(std::memory_order_acquire);
         if (original)
         {
-            original(queue, count, lists);
+            reinterpret_cast<D3D12ExecuteCommandListsFn>(original)(queue, count, lists);
         }
     }
 
@@ -38064,6 +39467,13 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         // this process lifetime and is re-initialized by the next injection.
         g_recorded_strokes_active.store(false, std::memory_order_release);
         g_recorded_strokes_suppress.store(0, std::memory_order_release);
+        g_stroke_discovery_active.store(false, std::memory_order_release);
+        recorded_strokes_uninstall_global_process_event_hook();
+        if (auto* recording_reflection = g_recorded_strokes_reflection.exchange(
+                nullptr, std::memory_order_acq_rel))
+        {
+            delete recording_reflection;
+        }
         g_recorded_strokes_hook_owned.store(false, std::memory_order_release);
         g_recorded_strokes_hook_slot.store(0, std::memory_order_release);
         {

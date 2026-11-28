@@ -320,7 +320,7 @@ public sealed class HostSession
             if (label == "start")
                 Log.Info($"Stroke recording started | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource}");
             else if (label == "stop")
-                Log.Info($"Stroke recording stopped | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource} | uv_with_brush={status.CapturedPaintAtUVWithBrush} | screen_position={status.CapturedPaintAtScreenPosition}");
+                Log.Info($"Stroke recording stopped | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource} | uv_with_brush={status.CapturedPaintAtUVWithBrush} | screen_position={status.CapturedPaintAtScreenPosition} | world_position={status.CapturedPaintAtWorldPosition} | batches={status.CapturedStrokeBatches} | server_batches={status.CapturedServerStrokeBatches} | queue={status.CapturedRecordedQueueStrokes} | events={status.PaintEventsObserved}/{status.PaintEventsCaptured} | ignored_receiver={status.PaintEventsIgnoredReceiver} | layout_unavailable={status.PaintEventsLayoutUnavailable} | global_hook={status.GlobalProcessEventHook} | zero_reason={status.ZeroCountReason} | discovered={status.DiscoverySummary}");
             else if (label == "clear")
                 Log.Info("Stroke recording cleared.");
             return status;
@@ -330,6 +330,44 @@ public sealed class HostSession
             Log.Error($"Stroke recording {label} failed: " + ex.Message);
             return new PaintStrokeRecordingStatus(false, ex.Message, false, 0, "", 0);
         }
+    }
+
+    private static string DescribeDiscoveredPaintFunctions(JsonElement metadata)
+    {
+        if (!metadata.TryGetProperty("discovered_paint_functions", out var entries) ||
+            entries.ValueKind != JsonValueKind.Array)
+        {
+            return "";
+        }
+        var parts = new List<string>();
+        foreach (var entry in entries.EnumerateArray())
+        {
+            if (parts.Count >= 8)
+            {
+                break;
+            }
+            var name = entry.TryGetProperty("name", out var nameElement) &&
+                       nameElement.ValueKind == JsonValueKind.String
+                ? nameElement.GetString() ?? ""
+                : "";
+            if (name.Length == 0)
+            {
+                continue;
+            }
+            var receiverClass = entry.TryGetProperty("receiver_class", out var classElement) &&
+                                classElement.ValueKind == JsonValueKind.String
+                ? classElement.GetString() ?? ""
+                : "";
+            var local = entry.TryGetProperty("local_receiver", out var localElement) &&
+                        localElement.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                        localElement.GetBoolean();
+            var calls = entry.TryGetProperty("calls", out var callsElement) &&
+                        callsElement.TryGetInt32(out var callsValue)
+                ? callsValue
+                : 0;
+            parts.Add($"{name}@{receiverClass}({(local ? "local" : "remote")},x{calls})");
+        }
+        return string.Join("; ", parts);
     }
 
     private static PaintStrokeRecordingStatus ParseStrokeRecordingStatus(string raw)
@@ -352,6 +390,11 @@ public sealed class HostSession
             var recordingSource = Text(metadata, "recording_source", "");
             var capturedUvWithBrush = Int(metadata, "captured_paint_at_uv_with_brush", 0);
             var capturedScreenPosition = Int(metadata, "captured_paint_at_screen_position", 0);
+            var capturedWorldPosition = Int(metadata, "captured_paint_at_world_position", 0);
+            var discovered = DescribeDiscoveredPaintFunctions(metadata);
+            var globalHook = metadata.TryGetProperty("global_process_event_hook", out var hookElement) &&
+                             hookElement.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                             hookElement.GetBoolean();
             var dropped = metadata.TryGetProperty("strokes_dropped", out var droppedElement) &&
                           droppedElement.TryGetInt64(out var droppedValue)
                 ? droppedValue
@@ -365,7 +408,22 @@ public sealed class HostSession
                 dropped,
                 recordingSource,
                 capturedUvWithBrush,
-                capturedScreenPosition);
+                capturedScreenPosition,
+                capturedWorldPosition,
+                Int(metadata, "captured_paint_at_uv", 0),
+                Int(metadata, "captured_stroke_batches", 0),
+                Int(metadata, "captured_server_stroke_batches", 0),
+                Int(metadata, "captured_native_strokes", 0),
+                Int(metadata, "captured_recorded_queue_strokes", 0),
+                Int(metadata, "paint_events_observed", 0),
+                Int(metadata, "paint_events_captured", 0),
+                Int(metadata, "paint_events_ignored_receiver", 0),
+                Int(metadata, "paint_events_layout_unavailable", 0),
+                globalHook,
+                Text(metadata, "zero_count_reason", ""),
+                Int(metadata, "discovery_paint_calls", 0),
+                Int(metadata, "discovery_paint_ignored_receiver", 0),
+                discovered);
         }
         catch (JsonException)
         {

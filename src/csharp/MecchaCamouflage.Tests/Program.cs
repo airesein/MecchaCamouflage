@@ -6089,6 +6089,36 @@ static void NativeStrokeRecordingGuardsReplay()
            bridge.Contains("screen_position_empty_returns", StringComparison.Ordinal) &&
            bridge.Contains("ignored_nonlocal_receivers", StringComparison.Ordinal),
         "recording must cover all local paint components and expose zero-count diagnostics");
+    Assert(bridge.Contains("recorded_strokes_install_global_process_event_hook", StringComparison.Ordinal) &&
+           bridge.Contains("global_hooked_process_event", StringComparison.Ordinal) &&
+           bridge.Contains("MH_CreateHook", StringComparison.Ordinal) &&
+           bridge.Contains("trusted_process_event_target", StringComparison.Ordinal),
+        "recording must prefer a verified global ProcessEvent MinHook instead of only one vtable slot");
+    Assert(bridge.Contains("recorded_paint_function_is_candidate", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_paint_function_spec", StringComparison.Ordinal) &&
+           bridge.Contains("PaintAtScreenPosition", StringComparison.Ordinal) &&
+           bridge.Contains("PaintAtWorldPosition", StringComparison.Ordinal) &&
+           bridge.Contains("strokebatch", StringComparison.Ordinal) &&
+           bridge.Contains("RecordedPaintKind::StrokeBatch", StringComparison.Ordinal),
+        "the global filter must resolve paint-at-UV/screen/world and stroke-batch UFunctions by name and reflected layout");
+    Assert(bridge.Contains("recorded_strokes_discovery_record", StringComparison.Ordinal) &&
+           bridge.Contains("discovered_paint_functions", StringComparison.Ordinal) &&
+           bridge.Contains("discovery_paint_layout_unavailable", StringComparison.Ordinal) &&
+           bridge.Contains("zero_count_reason", StringComparison.Ordinal) &&
+           bridge.Contains("paint_events_observed", StringComparison.Ordinal) &&
+           bridge.Contains("paint_events_ignored_receiver", StringComparison.Ordinal),
+        "a discovery window must list paint-related UFunctions/classes and explain count=0");
+    Assert(bridge.Contains("recorded_brush_at_component", StringComparison.Ordinal) &&
+           bridge.Contains("CurrentBrushSettings", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_capture_spec_before", StringComparison.Ordinal) &&
+           bridge.Contains("spec.brush_offset", StringComparison.Ordinal),
+        "each captured stroke must keep its call BrushSettings or the component CurrentBrushSettings at that call");
+    Assert(bridge.Contains("recorded_strokes_capture_queue", StringComparison.Ordinal) &&
+           bridge.Contains("QueuedLocalPaintBatches", StringComparison.Ordinal) &&
+           bridge.Contains("StrokeChunkBuffer", StringComparison.Ordinal) &&
+           bridge.Contains("captured_recorded_queue_strokes", StringComparison.Ordinal) &&
+           bridge.Contains("captured_server_stroke_batches", StringComparison.Ordinal),
+        "the recorded-stroke queue and server/batch sources must be captured and counted as fallbacks");
 }
 
 static void WebUiExposesPaintStrokeRecording()
@@ -6113,8 +6143,11 @@ static void WebUiExposesPaintStrokeRecording()
            app.Contains("send(\"clearPaintRecording\"", StringComparison.Ordinal) &&
            app.Contains("send(\"paintRecordingStatus\"", StringComparison.Ordinal) &&
            app.Contains("function refreshPaintRecordingStatus", StringComparison.Ordinal) &&
-           app.Contains("recording.active", StringComparison.Ordinal),
-        "the web UI must start/stop/clear recording and poll the live stroke count");
+           app.Contains("recording.active", StringComparison.Ordinal) &&
+           app.Contains("capturedPaintAtWorldPosition", StringComparison.Ordinal) &&
+           app.Contains("zeroCountReason", StringComparison.Ordinal) &&
+           app.Contains("discoverySummary", StringComparison.Ordinal),
+        "the web UI must start/stop/clear recording, poll the live stroke count, and show per-source/zero-count diagnostics");
     Assert(form.Contains("case \"startPaintRecording\"", StringComparison.Ordinal) &&
            form.Contains("case \"stopPaintRecording\"", StringComparison.Ordinal) &&
            form.Contains("case \"clearPaintRecording\"", StringComparison.Ordinal) &&

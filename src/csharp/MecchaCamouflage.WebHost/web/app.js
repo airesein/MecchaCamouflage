@@ -2502,7 +2502,21 @@ function applyPaintRecordingStatus(result) {
     dropped: Number(result.dropped || 0),
     recordingSource: result.recordingSource || "",
     capturedPaintAtUVWithBrush: Number(result.capturedPaintAtUVWithBrush || 0),
-    capturedPaintAtScreenPosition: Number(result.capturedPaintAtScreenPosition || 0)
+    capturedPaintAtScreenPosition: Number(result.capturedPaintAtScreenPosition || 0),
+    capturedPaintAtWorldPosition: Number(result.capturedPaintAtWorldPosition || 0),
+    capturedPaintAtUV: Number(result.capturedPaintAtUV || 0),
+    capturedStrokeBatches: Number(result.capturedStrokeBatches || 0),
+    capturedServerStrokeBatches: Number(result.capturedServerStrokeBatches || 0),
+    capturedNativeStrokes: Number(result.capturedNativeStrokes || 0),
+    capturedRecordedQueueStrokes: Number(result.capturedRecordedQueueStrokes || 0),
+    paintEventsObserved: Number(result.paintEventsObserved || 0),
+    paintEventsCaptured: Number(result.paintEventsCaptured || 0),
+    paintEventsIgnoredReceiver: Number(result.paintEventsIgnoredReceiver || 0),
+    paintEventsLayoutUnavailable: Number(result.paintEventsLayoutUnavailable || 0),
+    globalProcessEventHook: Boolean(result.globalProcessEventHook),
+    zeroCountReason: result.zeroCountReason || "",
+    discoveryPaintCalls: Number(result.discoveryPaintCalls || 0),
+    discoverySummary: result.discoverySummary || ""
   };
   renderReusePaintControls();
   updatePaintRecordingPoll();
@@ -2585,7 +2599,7 @@ function renderReusePaintControls() {
   if (recordStatus) {
     recordStatus.textContent = paintRecordingStatusLabel();
     const capture = [paintRecording.recordingSource, paintRecording.source].filter(Boolean).join(" | ");
-    const counts = `uv_with_brush=${paintRecording.capturedPaintAtUVWithBrush} screen_position=${paintRecording.capturedPaintAtScreenPosition}`;
+    const counts = `uv_with_brush=${paintRecording.capturedPaintAtUVWithBrush} screen_position=${paintRecording.capturedPaintAtScreenPosition} world_position=${paintRecording.capturedPaintAtWorldPosition} uv=${paintRecording.capturedPaintAtUV} batches=${paintRecording.capturedStrokeBatches} server_batches=${paintRecording.capturedServerStrokeBatches} native=${paintRecording.capturedNativeStrokes} queue=${paintRecording.capturedRecordedQueueStrokes} events=${paintRecording.paintEventsObserved}/${paintRecording.paintEventsCaptured} ignored_receiver=${paintRecording.paintEventsIgnoredReceiver} layout_unavailable=${paintRecording.paintEventsLayoutUnavailable} global_hook=${paintRecording.globalProcessEventHook}${paintRecording.zeroCountReason ? ` zero_reason=${paintRecording.zeroCountReason}` : ""}${paintRecording.discoverySummary ? ` discovered=${paintRecording.discoverySummary}` : ""}`;
     recordStatus.title = capture ? `${capture} | ${counts}` : counts;
     recordStatus.classList.toggle("active", paintRecording.active);
   }
