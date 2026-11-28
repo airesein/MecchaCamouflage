@@ -4,6 +4,13 @@ using System.Text.Json.Nodes;
 
 namespace MecchaCamouflage.Controller;
 
+public enum PaintReplayStrategy
+{
+    Adaptive,
+    Contour,
+    Dominant
+}
+
 public sealed record PaintTextureExportResult(
     bool Success,
     string Message,

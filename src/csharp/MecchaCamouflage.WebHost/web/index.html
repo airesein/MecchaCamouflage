@@ -133,6 +133,11 @@
                   </label>
                   <div class="action-bar reuse-paint-grid">
                     <div class="manual-paint-label" data-i18n="button.reuse.paint">Reuse Paint</div>
+                    <div class="region-choice reuse-paint-strategies" role="group" aria-label="Paint strategy" data-i18n-aria-label="reuse.strategy.label">
+                      <button class="active" type="button" data-reuse-paint-strategy="adaptive" aria-pressed="true" data-i18n="reuse.strategy.adaptive">Adaptive</button>
+                      <button type="button" data-reuse-paint-strategy="contour" aria-pressed="false" data-i18n="reuse.strategy.contour">Contour</button>
+                      <button type="button" data-reuse-paint-strategy="dominant" aria-pressed="false" data-i18n="reuse.strategy.dominant">Base + Detail</button>
+                    </div>
                     <button id="image-reuse-start" class="image-transfer-control" type="button" data-reuse-paint-command="start" data-i18n="button.start" disabled>Start</button>
                     <button id="image-reuse-stop" class="image-transfer-control danger-action" type="button" data-reuse-paint-command="stop" data-i18n="button.stop" disabled>Stop</button>
                     <button id="image-reuse-preview" class="image-transfer-control" type="button" data-reuse-paint-command="preview" data-i18n="button.preview" disabled>Preview</button>

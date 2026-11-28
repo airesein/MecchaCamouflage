@@ -27,14 +27,26 @@ texture up front: only the gradually submitted strokes appear. When no raw
 paths are supplied, the bridge retains the current-game-texture fallback for
 backward compatibility and internal use.
 
-Replay uses the same runtime mesh surface sample/plan generation as Image Paint:
-the live mesh profile, the RuntimePaintable triangle cache, and the Image Paint
-sample density (the Image brush size) produce the mesh samples. It does not use
+Replay uses the same runtime mesh surface sample generation as Image Paint.
+The live mesh profile and RuntimePaintable triangle cache are sampled at 70%
+of the configured Image brush size, with a one-texel minimum. It does not use
 the 4-face image or the canonical atlas. Each mesh sample's UV indexes the saved
 raw albedo/PBR texture directly (no `v` flip) with edge-clamped bilinear
-sampling. Replay never skips samples by alpha and never applies color
-compression. Strokes use `sRGB -> linear` albedo and channel 7 through
-`PaintAtUVWithBrush`.
+sampling. Replay uses the raw albedo and PBR values also used by Preview and
+stamps them with a solid brush through `PaintAtUVWithBrush` on channel 7.
+The Reuse Paint strategy buttons choose how Start plans the strokes.
+
+- Adaptive tries wide tiles first and subdivides around color and material changes.
+- Contour fits disks based on the distance to the nearest albedo or material edge.
+- Base + Detail paints a dominant color and material first, then replays the
+  remaining fine coverage. The base is constrained to its tile and sampled UV
+  island. A fine stroke is omitted only if the base covers its full footprint
+  and the saved texture is uniform around that sample.
+
+Both alternative strategies fall back to Adaptive when they do not save any
+strokes. The response and application log report the strategy used and base
+stroke count. The response also reports `replay_strokes_merged`,
+`replay_detail_strokes`, and `replay_largest_brush_texels`.
 
 Preview locally imports the archive and preserves the pre-preview material
 snapshot through the existing Preview/Unpreview mechanism. Stop Preview restores

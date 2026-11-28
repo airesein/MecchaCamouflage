@@ -1281,6 +1281,12 @@ function initializeImageEditor() {
     button.addEventListener("click", () => runReusePaintCommand(button.dataset.reusePaintCommand)
       .catch(error => showError(error.message || String(error))));
   }
+  for (const button of document.querySelectorAll("[data-reuse-paint-strategy]")) {
+    button.addEventListener("click", () => {
+      reusePaintStrategy = button.dataset.reusePaintStrategy;
+      renderReusePaintControls();
+    });
+  }
   const exportPath = byId("image-export-path");
   exportPath.addEventListener("input", renderReusePaintControls);
   exportPath.addEventListener("change", renderReusePaintControls);
@@ -2402,6 +2408,7 @@ async function saveImagePreset() {
 }
 
 let lastPaintExportManifest = "";
+let reusePaintStrategy = "adaptive";
 let reusePaintStartPending = false;
 let reusePaintPreviewPending = false;
 let reusePaintStopPending = false;
@@ -2417,6 +2424,12 @@ function renderReusePaintControls() {
   const activePaintKind = runtime?.activePaintKind || "";
   const activePreviewKind = runtime?.activePreviewKind || "";
   const hasPath = reusePaintPath().length > 0;
+  for (const button of document.querySelectorAll("[data-reuse-paint-strategy]")) {
+    const selected = button.dataset.reusePaintStrategy === reusePaintStrategy;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    button.disabled = running || reusePaintStartPending || reusePaintPreviewPending;
+  }
   const start = byId("image-reuse-start");
   if (start) start.disabled = !hasPath || running || reusePaintStartPending || reusePaintPreviewPending;
   const stop = byId("image-reuse-stop");
@@ -2473,7 +2486,7 @@ async function runReusePaintCommand(command) {
     renderReusePaintControls();
     toast(i18n("toast.image.export.replaying"));
     try {
-      const result = await send("reusePaintStart", { manifestPath }, 3600000);
+      const result = await send("reusePaintStart", { manifestPath, strategy: reusePaintStrategy }, 3600000);
       if (!result?.success) throw new Error(result?.message || "The saved paint could not be replayed.");
       lastPaintExportManifest = manifestPath;
       toast(i18n("toast.image.export.reused"));

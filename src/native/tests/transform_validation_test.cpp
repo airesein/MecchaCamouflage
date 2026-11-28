@@ -1,6 +1,7 @@
 #include "../include/sdk.hpp"
 #include "../include/runtime_contract.hpp"
 #include "../include/direct_bridge_abi.hpp"
+#include "../include/paint_texture_replay.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,228 @@ namespace
 
 int main()
 {
+    {
+        constexpr int size = 64;
+        constexpr float radius = 4.0f / size;
+        constexpr double max_radius = 0.16;
+        std::vector<std::uint8_t> albedo(size * size * 4, 128);
+        std::vector<std::uint8_t> pbr(size * size * 4, 64);
+        const paint_texture_replay::Texture texture{size, albedo, pbr};
+        struct Sample { double u; double v; };
+        const std::vector<Sample> samples{
+            {0.53, 0.53}, {0.59, 0.53}, {0.53, 0.59}, {0.59, 0.59},
+            {0.01, 0.01}, {0.06, 0.06}};
+        const auto channels = texture.sample(0.53, 0.59);
+        if (std::abs(channels[0] - 128.0 / 255.0) > 0.000001 ||
+            std::abs(channels[3] - 64.0 / 255.0) > 0.000001)
+        {
+            return 180;
+        }
+        const auto radii = paint_texture_replay::plan_brush_radii(
+            texture, samples, radius, max_radius);
+        const auto flat_radii_end = radii.begin() + 4;
+        if (*std::max_element(radii.begin(), flat_radii_end) <
+                std::hypot(0.06, 0.06) + radius ||
+            std::count(radii.begin(), flat_radii_end, 0.0f) != 3 ||
+            radii[4] != radius || radii[5] != radius)
+        {
+            return 181;
+        }
+
+        // A material detail near the widened brush blocks merging even when
+        // the original sample centers all have the same color and material.
+        constexpr std::size_t detail = (47 * size + 33) * 4;
+        pbr[detail + 1] = 99;
+        if (paint_texture_replay::plan_brush_radii(texture, samples, radius, max_radius) !=
+            std::vector<float>(samples.size(), radius))
+        {
+            return 182;
+        }
+        pbr[detail + 1] = 64;
+        albedo[detail + 2] = 220;
+        if (paint_texture_replay::plan_brush_radii(texture, samples, radius, max_radius) !=
+            std::vector<float>(samples.size(), radius))
+        {
+            return 183;
+        }
+
+        const double u = 33.0 / (size - 1);
+        const double v = 46.5 / (size - 1);
+        const auto interpolated = texture.sample(u, v);
+        if (std::abs(interpolated[2] - (128.0 + 220.0) / (2.0 * 255.0)) > 0.000001)
+        {
+            return 184;
+        }
+    }
+    {
+        constexpr int size = 256;
+        constexpr float detail_radius = 3.5f / size;
+        constexpr double max_radius = 40.0 / size;
+        std::vector<std::uint8_t> albedo(size * size * 4, 128);
+        std::vector<std::uint8_t> pbr(size * size * 4, 64);
+        const paint_texture_replay::Texture texture{size, albedo, pbr};
+        for (int y = 0; y < size; ++y)
+        {
+            for (int x = 120; x < 136; ++x)
+            {
+                pbr[texture.offset(x, y) + 1] = (x + y) % 2 == 0 ? 180 : 64;
+            }
+        }
+        struct Sample { double u; double v; };
+        std::vector<Sample> samples;
+        for (int y = 3; y < size; y += 3)
+        {
+            for (int x = 3; x < size; x += 3)
+            {
+                samples.push_back({static_cast<double>(x) / size,
+                                   static_cast<double>(y) / size});
+            }
+        }
+        const auto radii = paint_texture_replay::plan_brush_radii(
+            texture, samples, detail_radius, max_radius);
+        const auto largest = *std::max_element(radii.begin(), radii.end());
+        const auto omitted = std::count(radii.begin(), radii.end(), 0.0f);
+        if (largest < 24.0 / size || largest > max_radius ||
+            static_cast<std::size_t>(omitted) < samples.size() / 2)
+        {
+            return 185;
+        }
+        std::vector<std::size_t> merged_strokes;
+        for (std::size_t i = 0; i < radii.size(); ++i)
+        {
+            if (radii[i] > detail_radius)
+            {
+                merged_strokes.push_back(i);
+            }
+        }
+        for (std::size_t i = 0; i < samples.size(); ++i)
+        {
+            const auto& sample = samples[i];
+            if (sample.u >= 121.0 / size && sample.u < 136.0 / size &&
+                radii[i] != detail_radius)
+            {
+                return 186;
+            }
+            if (radii[i] != 0.0f)
+            {
+                continue;
+            }
+            bool covered = false;
+            for (const auto j : merged_strokes)
+            {
+                const double reach = radii[j] - detail_radius;
+                const double du = sample.u - samples[j].u;
+                const double dv = sample.v - samples[j].v;
+                if (du * du + dv * dv <= reach * reach)
+                {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered)
+            {
+                return 187;
+            }
+        }
+    }
+    {
+        using namespace paint_texture_replay;
+        constexpr int size = 256;
+        constexpr float detail_radius = 2.5f / size;
+        constexpr double max_radius = 40.0 / size;
+        std::vector<std::uint8_t> albedo(size * size * 4, 128);
+        std::vector<std::uint8_t> pbr(size * size * 4, 64);
+        const Texture texture{size, albedo, pbr};
+        struct Sample { double u; double v; int uv_island; };
+        std::vector<Sample> samples;
+        for (int y = 6; y < size - 6; y += 2)
+        {
+            for (int x = 6; x < size - 6; x += 2)
+            {
+                samples.push_back({double(x) / (size - 1), double(y) / (size - 1), 0});
+            }
+        }
+        // The diagonal stripe differs only in roughness, so color-only merging
+        // would miss it. The base plan should repaint it in a later stroke.
+        for (int y = 0; y < size; ++y)
+        {
+            for (int x = std::max(0, y - 3); x <= std::min(size - 1, y + 3); ++x)
+            {
+                pbr[texture.offset(x, y) + 1] = 110;
+            }
+        }
+        const auto adaptive = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Adaptive);
+        const auto contour = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Contour);
+        const auto dominant = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Dominant);
+        if (contour.strategy != Strategy::Contour || contour.stroke_count() >= adaptive.stroke_count() ||
+            dominant.strategy != Strategy::Dominant || dominant.stroke_count() >= adaptive.stroke_count() ||
+            dominant.base_strokes.empty() || contour.base_strokes.size() != 0)
+        {
+            return 188;
+        }
+
+        const auto rasterize = [&](const ReplayPlan& plan) {
+            constexpr auto unpainted = std::numeric_limits<std::uint64_t>::max();
+            std::vector<std::uint64_t> pixels(size * size, unpainted);
+            const auto stamp = [&](std::size_t index, float radius, std::uint64_t material) {
+                const double u = samples[index].u * (size - 1);
+                const double v = samples[index].v * (size - 1);
+                const double extent = radius * (size - 1);
+                for (int y = std::max(0, static_cast<int>(std::ceil(v - extent)));
+                     y <= std::min(size - 1, static_cast<int>(std::floor(v + extent))); ++y)
+                {
+                    for (int x = std::max(0, static_cast<int>(std::ceil(u - extent)));
+                         x <= std::min(size - 1, static_cast<int>(std::floor(u + extent))); ++x)
+                    {
+                        if ((x - u) * (x - u) + (y - v) * (y - v) <= extent * extent)
+                        {
+                            pixels[texture.offset(x, y) / 4] = material;
+                        }
+                    }
+                }
+            };
+            for (const auto& base : plan.base_strokes)
+            {
+                stamp(base.sample_index, base.radius, base.material);
+            }
+            for (std::size_t i = 0; i < samples.size(); ++i)
+            {
+                if (plan.radii[i] == 0.0f) continue;
+                stamp(i, plan.radii[i], texture.material_key(
+                    texture.nearest_texel(samples[i].u, samples[i].v)));
+            }
+            return pixels;
+        };
+        const auto baseline_pixels = rasterize(adaptive);
+        const auto contour_pixels = rasterize(contour);
+        const auto dominant_pixels = rasterize(dominant);
+        for (const auto& sample : samples)
+        {
+            const auto pixel = texture.nearest_texel(sample.u, sample.v);
+            if (baseline_pixels[pixel] == std::numeric_limits<std::uint64_t>::max() ||
+                contour_pixels[pixel] != baseline_pixels[pixel] ||
+                dominant_pixels[pixel] != baseline_pixels[pixel])
+            {
+                return 189;
+            }
+        }
+        for (std::size_t i = 0; i < samples.size(); ++i)
+        {
+            samples[i].uv_island = static_cast<int>(i % 2);
+        }
+        const auto split_islands = plan_replay(texture, samples, detail_radius, max_radius, Strategy::Dominant);
+        if (split_islands.strategy != Strategy::Adaptive || !split_islands.base_strokes.empty())
+        {
+            return 190;
+        }
+        const auto channels = material_channels(texture.material_key(texture.nearest_texel(0.5, 0.5)));
+        if (std::abs(channels[0] - 128.0 / 255.0) > 0.000001 ||
+            std::abs(channels[4] - 110.0 / 255.0) > 0.000001 ||
+            strategy_from_name("unknown") != Strategy::Adaptive)
+        {
+            return 191;
+        }
+    }
     BridgeStartBlockV2 bootstrap{};
     bootstrap.magic = BridgeStartMagicV2;
     bootstrap.size = sizeof(bootstrap);

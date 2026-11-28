@@ -643,7 +643,8 @@ public sealed class HostSession
 
     public async Task<PaintTextureReuseResult> StartReusePaintAsync(
         string manifestPath,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PaintReplayStrategy strategy = PaintReplayStrategy.Adaptive)
     {
         var source = TryPreparePaintTextureSource(manifestPath, out var message);
         if (source is null)
@@ -669,7 +670,8 @@ public sealed class HostSession
                 source.AlbedoPath,
                 source.PbrPath,
                 colorCompressionTolerance,
-                cancellationToken);
+                cancellationToken,
+                strategy);
             if (!replay.Success)
             {
                 Log.Warn("Reuse Paint failed: " +
@@ -732,7 +734,8 @@ public sealed class HostSession
         string? albedoPath = null,
         string? pbrPath = null,
         double? colorCompressionTolerance = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PaintReplayStrategy strategy = PaintReplayStrategy.Adaptive)
     {
         int runGeneration;
         lock (paintStateGate)
@@ -778,9 +781,16 @@ public sealed class HostSession
                 return new PaintTextureReplayResult(false, failureMessage, "cancelled");
             }
 
+            var strategyName = strategy switch
+            {
+                PaintReplayStrategy.Contour => "contour",
+                PaintReplayStrategy.Dominant => "dominant",
+                _ => "adaptive"
+            };
             var payload = new Dictionary<string, object>
             {
-                ["type"] = "replay_paint_texture"
+                ["type"] = "replay_paint_texture",
+                ["replay_strategy"] = strategyName
             };
             if (brushSizeTexels is not null)
                 payload["brush_size_texels"] = brushSizeTexels.Value;
@@ -802,7 +812,7 @@ public sealed class HostSession
                 JsonSerializer.Serialize(payload),
                 cancellationToken);
             var message = FriendlyBridgeMessage(response.Message.Length > 0 ? response.Message : response.Stage);
-            var (replyTextureSize, strokeCount) = ParseReplayMetadata(response.Raw);
+            var (replyTextureSize, strokeCount, usedStrategy, baseStrokes) = ParseReplayMetadata(response.Raw);
             if (response.Success)
             {
                 lock (paintStateGate)
@@ -811,6 +821,8 @@ public sealed class HostSession
                         nativePaintMayBeRunning = false;
                 }
                 LogFinalProgressOnce();
+                if (!string.IsNullOrEmpty(usedStrategy))
+                    Log.Info($"Reuse Paint strategy | requested={strategyName} | used={usedStrategy} | base strokes={baseStrokes}");
                 var completed = strokeCount > 0
                     ? $"Reuse Paint: painted {strokeCount} UV strokes onto the body | size={replyTextureSize}"
                     : "Reuse Paint: saved texture painted onto the body.";
@@ -874,25 +886,27 @@ public sealed class HostSession
         }
     }
 
-    private static (int TextureSize, int StrokeCount) ParseReplayMetadata(string raw)
+    private static (int TextureSize, int StrokeCount, string UsedStrategy, int BaseStrokes) ParseReplayMetadata(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
-            return (0, 0);
+            return (0, 0, "", 0);
         try
         {
             using var document = JsonDocument.Parse(raw);
             if (!document.RootElement.TryGetProperty("metadata", out var metadata) ||
                 metadata.ValueKind != JsonValueKind.Object)
             {
-                return (0, 0);
+                return (0, 0, "", 0);
             }
             return (
                 Int(metadata, "texture_size", 0),
-                Int(metadata, "replay_strokes_total", 0));
+                Int(metadata, "replay_strokes_total", 0),
+                Text(metadata, "replay_strategy_used", ""),
+                Int(metadata, "replay_base_strokes", 0));
         }
         catch
         {
-            return (0, 0);
+            return (0, 0, "", 0);
         }
     }
 
