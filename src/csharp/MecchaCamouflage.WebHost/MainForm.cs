@@ -1159,8 +1159,14 @@ public sealed class MainForm : Form
                 return HandleSaveImagePreset(command.Payload);
             case "exportCurrentPaint":
                 return await HandleExportCurrentPaintAsync();
-            case "importCurrentPaint":
-                return await HandleImportCurrentPaintAsync(command.Payload);
+            case "reusePaintStart":
+                return ApplyPaintResult(await HandleReusePaintStartAsync(command.Payload));
+            case "reusePaintStop":
+                return ApplyPaintResult(await session.StopPaintAsync());
+            case "reusePaintPreview":
+                return ApplyPaintResult(await HandleReusePaintPreviewAsync(command.Payload));
+            case "reusePaintStopPreview":
+                return ApplyPaintResult(await session.StopReusePaintPreviewAsync());
             case "listPaintExports":
                 return session.GetLatestPaintExport();
             case "paint":
@@ -1269,24 +1275,53 @@ public sealed class MainForm : Form
         };
     }
 
-    private async Task<object> HandleImportCurrentPaintAsync(JsonElement payload)
+    private static bool TryReadPaintExportPath(JsonElement payload, out string manifestPath, out string message)
     {
-        var manifestPath = payload.TryGetProperty("manifestPath", out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString() ?? ""
+        manifestPath = payload.TryGetProperty("manifestPath", out var value) &&
+                       value.ValueKind == JsonValueKind.String
+            ? value.GetString()?.Trim() ?? ""
             : "";
+        message = "";
         if (string.IsNullOrWhiteSpace(manifestPath))
-            return new { success = false, message = "Export the current paint first." };
-        var result = await session.ReusePaintTextureAsync(manifestPath);
-        return new
         {
-            success = result.Success,
-            message = result.Message,
-            stage = result.Stage,
-            localImportSucceeded = result.LocalImportSucceeded,
-            replaySucceeded = result.ReplaySucceeded,
-            textureSize = result.TextureSize,
-            strokeCount = result.StrokeCount
-        };
+            message = "Choose a saved paint file first.";
+            return false;
+        }
+        if (!File.Exists(manifestPath))
+        {
+            message = "The selected paint file does not exist.";
+            return false;
+        }
+        var extension = Path.GetExtension(manifestPath);
+        if (!string.Equals(extension, PaintTextureArchive.Extension, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(extension, ".json", StringComparison.OrdinalIgnoreCase))
+        {
+            message = "Choose a .mcpaint archive or a legacy .json paint export.";
+            return false;
+        }
+        return true;
+    }
+
+    private async Task<HostCommandResult> HandleReusePaintStartAsync(JsonElement payload)
+    {
+        if (!TryReadPaintExportPath(payload, out var manifestPath, out var message))
+            return new HostCommandResult(false, message, CommandResultLevel.Warn);
+        var result = await session.StartReusePaintAsync(manifestPath);
+        return new HostCommandResult(
+            result.Success,
+            result.Message,
+            result.Success ? CommandResultLevel.Success : CommandResultLevel.Error);
+    }
+
+    private async Task<HostCommandResult> HandleReusePaintPreviewAsync(JsonElement payload)
+    {
+        if (!TryReadPaintExportPath(payload, out var manifestPath, out var message))
+            return new HostCommandResult(false, message, CommandResultLevel.Warn);
+        var result = await session.PreviewPaintTextureAsync(manifestPath);
+        return new HostCommandResult(
+            result.Success,
+            result.Success ? "Preview: applied." : result.Message,
+            result.Success ? CommandResultLevel.Success : CommandResultLevel.Error);
     }
 
     private bool TryReadImageDesign(JsonElement payload, out ImagePaintSettings design, out string message)

@@ -9,7 +9,8 @@ namespace MecchaCamouflage.Controller;
 public enum PaintKind
 {
     Standard,
-    Image
+    Image,
+    Reuse
 }
 
 public sealed class HostSession
@@ -61,6 +62,13 @@ public sealed class HostSession
         Sending,
         AcceptedAwaitingTerminal
     }
+
+    private sealed record PaintTextureSource(
+        string ManifestPath,
+        string AlbedoPath,
+        string PbrPath,
+        int TextureSize,
+        string TempDirectory);
 
     public HostSession(string version, int diagnosticStrokeLimit = 0)
     {
@@ -398,7 +406,40 @@ public sealed class HostSession
         return new PaintTextureExportResult(true, "", directory, manifestPath, albedoPngPath, pbrPngPath, size);
     }
 
-    public async Task<PaintTextureImportResult> ImportPaintTextureAsync(string manifestPath, CancellationToken cancellationToken = default)
+    public Task<PaintTextureImportResult> ImportPaintTextureAsync(
+        string manifestPath,
+        CancellationToken cancellationToken = default) =>
+        ImportPaintTextureInternalAsync(manifestPath, preservePreviewSnapshot: false, cancellationToken);
+
+    public async Task<PaintTextureImportResult> PreviewPaintTextureAsync(
+        string manifestPath,
+        CancellationToken cancellationToken = default)
+    {
+        lock (paintStateGate)
+        {
+            if (PaintRunning || nativePaintMayBeRunning)
+            {
+                const string message = "Stop the active paint before previewing a paint export.";
+                Log.Warn("Paint preview failed: " + message);
+                return new PaintTextureImportResult(false, message, "paint_running");
+            }
+        }
+        var result = await ImportPaintTextureInternalAsync(
+            manifestPath,
+            preservePreviewSnapshot: true,
+            cancellationToken);
+        if (result.Success)
+        {
+            lock (paintStateGate)
+                activePreviewKind = PaintKind.Reuse;
+        }
+        return result;
+    }
+
+    private async Task<PaintTextureImportResult> ImportPaintTextureInternalAsync(
+        string manifestPath,
+        bool preservePreviewSnapshot,
+        CancellationToken cancellationToken)
     {
         lock (paintStateGate)
         {
@@ -417,7 +458,10 @@ public sealed class HostSession
                 try
                 {
                     PaintTextureArchive.Extract(manifestPath, staging);
-                    var result = await ImportPaintTextureCoreAsync(Path.Combine(staging, "manifest.json"), cancellationToken);
+                    var result = await ImportPaintTextureCoreAsync(
+                        Path.Combine(staging, "manifest.json"),
+                        preservePreviewSnapshot,
+                        cancellationToken);
                     if (!result.Success)
                         Log.Warn("Paint import failed: " + (string.IsNullOrWhiteSpace(result.Message) ? "unknown" : result.Message));
                     return result;
@@ -433,7 +477,10 @@ public sealed class HostSession
                     }
                 }
             }
-            var legacy = await ImportPaintTextureCoreAsync(manifestPath, cancellationToken);
+            var legacy = await ImportPaintTextureCoreAsync(
+                manifestPath,
+                preservePreviewSnapshot,
+                cancellationToken);
             if (!legacy.Success)
                 Log.Warn("Paint import failed: " + (string.IsNullOrWhiteSpace(legacy.Message) ? "unknown" : legacy.Message));
             return legacy;
@@ -445,13 +492,22 @@ public sealed class HostSession
         }
     }
 
-    private async Task<PaintTextureImportResult> ImportPaintTextureCoreAsync(string manifestPath, CancellationToken cancellationToken)
+    private static bool TryReadPaintTextureManifest(
+        string manifestPath,
+        out string albedoPath,
+        out string pbrPath,
+        out int size,
+        out string message)
     {
+        albedoPath = "";
+        pbrPath = "";
+        size = 0;
+        message = "";
         if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath))
-            return new PaintTextureImportResult(false, "The selected paint export does not exist.", "manifest_missing");
-        string albedoPath;
-        string pbrPath;
-        int size;
+        {
+            message = "The selected paint export does not exist.";
+            return false;
+        }
         try
         {
             using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
@@ -460,7 +516,8 @@ public sealed class HostSession
                 schema.ValueKind != JsonValueKind.String ||
                 !string.Equals(schema.GetString(), "meccha_paint_texture_export_v1", StringComparison.Ordinal))
             {
-                return new PaintTextureImportResult(false, "The selected file is not a supported paint export.", "manifest_schema");
+                message = "The selected file is not a supported paint export.";
+                return false;
             }
             if (!root.TryGetProperty("texture_size", out var sizeElement) ||
                 !sizeElement.TryGetInt32(out size) || size <= 0 ||
@@ -469,7 +526,8 @@ public sealed class HostSession
                 !root.TryGetProperty("pbr_rgba", out var pbrElement) ||
                 pbrElement.ValueKind != JsonValueKind.String)
             {
-                return new PaintTextureImportResult(false, "The paint export manifest is invalid.", "manifest_fields");
+                message = "The paint export manifest is invalid.";
+                return false;
             }
             var directory = Path.GetDirectoryName(Path.GetFullPath(manifestPath))!;
             albedoPath = Path.Combine(directory, albedoElement.GetString()!);
@@ -477,10 +535,84 @@ public sealed class HostSession
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            return new PaintTextureImportResult(false, "Could not read the paint export: " + ex.Message, "manifest_read");
+            message = "Could not read the paint export: " + ex.Message;
+            return false;
         }
         if (!File.Exists(albedoPath) || !File.Exists(pbrPath))
-            return new PaintTextureImportResult(false, "The paint export texture files are missing.", "texture_missing");
+        {
+            message = "The paint export texture files are missing.";
+            return false;
+        }
+        return true;
+    }
+
+    private PaintTextureSource? TryPreparePaintTextureSource(string manifestPath, out string message)
+    {
+        message = "";
+        var tempDirectory = "";
+        try
+        {
+            if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath))
+            {
+                message = "The selected paint export does not exist.";
+                return null;
+            }
+            string manifestFile;
+            if (string.Equals(Path.GetExtension(manifestPath), PaintTextureArchive.Extension, StringComparison.OrdinalIgnoreCase))
+            {
+                tempDirectory = Path.Combine(
+                    Path.GetTempPath(),
+                    "MecchaCamouflage",
+                    "paint-replay-" + Guid.NewGuid().ToString("N"));
+                PaintTextureArchive.Extract(manifestPath, tempDirectory);
+                manifestFile = Path.Combine(tempDirectory, "manifest.json");
+            }
+            else if (string.Equals(Path.GetExtension(manifestPath), ".json", StringComparison.OrdinalIgnoreCase))
+            {
+                manifestFile = Path.GetFullPath(manifestPath);
+            }
+            else
+            {
+                message = "Choose a .mcpaint archive or a legacy .json paint export.";
+                return null;
+            }
+            if (!TryReadPaintTextureManifest(manifestFile, out var albedoPath, out var pbrPath, out var size, out message))
+                return null;
+            return new PaintTextureSource(manifestFile, albedoPath, pbrPath, size, tempDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            message = "Could not prepare the paint export: " + ex.Message;
+            return null;
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(tempDirectory) &&
+                (message.Length > 0 || Directory.Exists(tempDirectory) && !File.Exists(Path.Combine(tempDirectory, "manifest.json"))))
+            {
+                TryDeleteDirectory(tempDirectory);
+            }
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            Directory.Delete(path, true);
+        }
+        catch
+        {
+        }
+    }
+
+    private async Task<PaintTextureImportResult> ImportPaintTextureCoreAsync(
+        string manifestPath,
+        bool preservePreviewSnapshot,
+        CancellationToken cancellationToken)
+    {
+        if (!TryReadPaintTextureManifest(manifestPath, out var albedoPath, out var pbrPath, out var size, out var message))
+            return new PaintTextureImportResult(false, message, "manifest_invalid");
 
         using var process = Runtime.FindGameProcess(Settings.GameProcessName);
         if (process is null)
@@ -492,7 +624,8 @@ public sealed class HostSession
             type = "import_paint_texture",
             albedo_path = albedoPath,
             pbr_path = pbrPath,
-            texture_size = size
+            texture_size = size,
+            preview_only = preservePreviewSnapshot
         });
         var reply = await Runtime.SendPaintCommandAsync(payload, TimeSpan.FromSeconds(120), cancellationToken);
         if (!reply.Ok || !reply.Success)
@@ -502,51 +635,93 @@ public sealed class HostSession
                 string.IsNullOrWhiteSpace(reply.Message) ? "The game rejected the paint texture." : reply.Message,
                 reply.Stage);
         }
-        Log.Info($"Paint texture imported locally | size={size} | manifest={manifestPath}");
+        Log.Info(preservePreviewSnapshot
+            ? $"Paint texture preview imported locally | size={size} | manifest={manifestPath}"
+            : $"Paint texture imported locally | size={size} | manifest={manifestPath}");
         return new PaintTextureImportResult(true, "", reply.Stage);
     }
 
-    public async Task<PaintTextureReuseResult> ReusePaintTextureAsync(
+    public async Task<PaintTextureReuseResult> StartReusePaintAsync(
         string manifestPath,
-        double? brushSizeTexels = null,
-        int? stepTexels = null,
-        int? textureSize = null,
-        string? bodyType = null,
         CancellationToken cancellationToken = default)
     {
-        var local = await ImportPaintTextureAsync(manifestPath, cancellationToken);
-        if (!local.Success)
-            return new PaintTextureReuseResult(false, local.Message, local.Stage, false, false);
-
-        var replay = await ReplayPaintTextureAsync(
-            brushSizeTexels,
-            stepTexels,
-            textureSize,
-            bodyType,
-            cancellationToken);
-        if (!replay.Success)
+        var source = TryPreparePaintTextureSource(manifestPath, out var message);
+        if (source is null)
         {
-            var message = "The paint export was imported locally, but painting it onto the body could not start: " +
-                          (string.IsNullOrWhiteSpace(replay.Message) ? "unknown error" : replay.Message);
             Log.Warn("Reuse Paint failed: " + message);
+            return new PaintTextureReuseResult(false, message, "manifest_invalid", false, false);
+        }
+        try
+        {
+            double brushSizeTexels;
+            double colorCompressionTolerance;
+            lock (paintStateGate)
+            {
+                brushSizeTexels = Settings.Image.BrushSizeTexels;
+                colorCompressionTolerance = Settings.Image.ColorCompressionTolerance;
+            }
+            var stepTexels = Math.Max(1, (int)(brushSizeTexels / 2.0));
+            var replay = await ReplayPaintTextureAsync(
+                brushSizeTexels,
+                stepTexels,
+                source.TextureSize,
+                null,
+                source.AlbedoPath,
+                source.PbrPath,
+                colorCompressionTolerance,
+                cancellationToken);
+            if (!replay.Success)
+            {
+                Log.Warn("Reuse Paint failed: " +
+                         (string.IsNullOrWhiteSpace(replay.Message) ? "unknown error" : replay.Message));
+                return new PaintTextureReuseResult(
+                    false,
+                    replay.Message,
+                    replay.Stage,
+                    false,
+                    false,
+                    replay.TextureSize,
+                    replay.StrokeCount);
+            }
             return new PaintTextureReuseResult(
-                false,
-                message,
-                replay.Stage,
                 true,
+                replay.Message,
+                replay.Stage,
                 false,
+                true,
                 replay.TextureSize,
                 replay.StrokeCount);
         }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(source.TempDirectory))
+                TryDeleteDirectory(source.TempDirectory);
+        }
+    }
 
-        return new PaintTextureReuseResult(
-            true,
-            "Paint texture imported and painted onto the body.",
-            replay.Stage,
-            true,
-            true,
-            replay.TextureSize,
-            replay.StrokeCount);
+    public async Task<HostCommandResult> StopReusePaintPreviewAsync(
+        CancellationToken cancellationToken = default)
+    {
+        lock (paintStateGate)
+        {
+            if (PaintRunning || nativePaintMayBeRunning)
+            {
+                const string message = "Stop the active paint before restoring the preview.";
+                Log.Warn(message);
+                return new HostCommandResult(false, message, CommandResultLevel.Warn);
+            }
+            if (activePreviewKind != PaintKind.Reuse)
+            {
+                const string noPreview = "Preview: no active preview to restore.";
+                Log.Warn(noPreview);
+                return new HostCommandResult(false, noPreview, CommandResultLevel.Warn);
+            }
+        }
+        return await RunPaintAsync(
+            PaintKind.Standard,
+            previewOnly: false,
+            unpreviewOnly: true,
+            cancellationToken);
     }
 
     public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync(
@@ -554,6 +729,9 @@ public sealed class HostSession
         int? stepTexels = null,
         int? textureSize = null,
         string? bodyType = null,
+        string? albedoPath = null,
+        string? pbrPath = null,
+        double? colorCompressionTolerance = null,
         CancellationToken cancellationToken = default)
     {
         int runGeneration;
@@ -566,7 +744,7 @@ public sealed class HostSession
                 return new PaintTextureReplayResult(false, message, "paint_running");
             }
             PaintRunning = true;
-            activePaintKind = PaintKind.Standard;
+            activePaintKind = PaintKind.Reuse;
             runGeneration = ++nextPaintGeneration;
             activePaintGeneration = runGeneration;
             cancelState = PaintCancelState.None;
@@ -612,6 +790,12 @@ public sealed class HostSession
                 payload["texture_size"] = textureSize.Value;
             if (!string.IsNullOrWhiteSpace(bodyType))
                 payload["body_type"] = bodyType.Trim();
+            if (!string.IsNullOrWhiteSpace(albedoPath))
+                payload["albedo_path"] = albedoPath;
+            if (!string.IsNullOrWhiteSpace(pbrPath))
+                payload["pbr_path"] = pbrPath;
+            if (colorCompressionTolerance is not null)
+                payload["color_compression_tolerance"] = colorCompressionTolerance.Value;
 
             Log.Info("Reuse Paint: painting the saved texture onto the body. This may take a while.");
             var response = await Runtime.SendPaintAsync(
@@ -2714,6 +2898,7 @@ public sealed class HostSession
     {
         PaintKind.Standard => "standard",
         PaintKind.Image => "image",
+        PaintKind.Reuse => "reuse",
         _ => ""
     };
 

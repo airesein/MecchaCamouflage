@@ -102,8 +102,8 @@ var tests = new List<(string Name, Action Run)>
     ("legacy image transforms migrate to individual layers", LegacyImageTransformsMigrateToIndividualLayers),
     ("image preset round-trips an uncompressed container", ImagePresetRoundTripsUncompressedContainer),
     ("paint texture archive normalizes manifest texture names", PaintTextureArchiveNormalizesManifest),
-    ("reuse paint requests direct UV replay after local import", ReusePaintRequestsDirectUvReplay),
-    ("native replay samples the UV texture directly", NativeReplaySamplesUvTextureDirectly),
+    ("reuse paint start previews and stops through direct UV replay", ReusePaintRequestsDirectUvReplay),
+    ("native replay samples raw UV textures with brush and compression settings", NativeReplaySamplesUvTextureDirectly),
     ("v1 image preset expands global transforms to layers", V1ImagePresetExpandsGlobalTransformsToLayers),
     ("GUI image save persists the active preset state", GuiImageSavePersistsActivePresetState),
     ("legacy image config migrates to active image state", LegacyImageConfigMigratesToDiskLibrary),
@@ -123,6 +123,7 @@ var tests = new List<(string Name, Action Run)>
     ("web ui keeps setting and log tabs distinct without visual noise", WebUiSeparatesSettingAndLogTabs),
     ("web ui scopes edit actions to the active settings tab", WebUiScopesEditActionsToActiveSettingsTab),
     ("web ui keeps manual paint controls inside logs", WebUiOffersManualPaintControls),
+    ("web ui enable reuse paint controls from the path input", WebUiEnablesReusePaintFromPathInput),
     ("runtime snapshot reports manual paint state", RuntimeSnapshotReportsManualPaintState),
     ("paint feedback uses one severity path for buttons and hotkeys", PaintFeedbackUsesOneSeverityPath),
     ("web ui reports the WebView zoom factor in the footer", WebUiReportsWebViewZoomFactorInFooter),
@@ -3367,6 +3368,35 @@ static void WebUiOffersManualPaintControls()
         "manual Paint controls must reuse the same four-button action bar as the settings tabs");
 }
 
+static void WebUiEnablesReusePaintFromPathInput()
+{
+    var repository = FindRepositoryRoot();
+    var markup = ReadRepositoryText(Path.Combine(
+        repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
+    var app = ReadRepositoryText(Path.Combine(
+        repository, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+
+    Assert(markup.Contains("id=\"image-export-path\"", StringComparison.Ordinal) &&
+           markup.Contains("class=\"action-bar reuse-paint-grid\"", StringComparison.Ordinal),
+        "Reuse Paint must keep the path input and use the shared action-bar styling");
+    Assert(app.Contains("function reusePaintPath()", StringComparison.Ordinal) &&
+           app.Contains("function renderReusePaintControls()", StringComparison.Ordinal) &&
+           app.Contains("const hasPath = reusePaintPath().length > 0", StringComparison.Ordinal) &&
+           app.Contains("start.disabled = !hasPath || running", StringComparison.Ordinal) &&
+           app.Contains("preview.disabled = !hasPath || running", StringComparison.Ordinal) &&
+           app.Contains("exportPath.addEventListener(\"input\", renderReusePaintControls)", StringComparison.Ordinal),
+        "Start and Preview must enable from non-empty path input text");
+    Assert(app.Contains("activePaintKind !== \"reuse\"", StringComparison.Ordinal) &&
+           app.Contains("activePreviewKind !== \"reuse\"", StringComparison.Ordinal) &&
+           app.Contains("send(\"reusePaintStart\", { manifestPath }", StringComparison.Ordinal) &&
+           app.Contains("send(\"reusePaintPreview\", { manifestPath }", StringComparison.Ordinal) &&
+           app.Contains("send(\"reusePaintStop\"", StringComparison.Ordinal) &&
+           app.Contains("send(\"reusePaintStopPreview\"", StringComparison.Ordinal),
+        "Stop and Stop Preview must follow the active Reuse Paint state and send the matching commands");
+    Assert(!app.Contains("byId(\"image-reuse-paint\")", StringComparison.Ordinal),
+        "the old single Reuse Paint action must be removed");
+}
+
 static void RuntimeSnapshotReportsManualPaintState()
 {
     using var temp = new TempHome();
@@ -3411,7 +3441,7 @@ static void WebUiReportsWebViewZoomFactorInFooter()
 
     Assert(markup.Contains("id=\"footer-zoom\">100%</span>", StringComparison.Ordinal) &&
            !markup.Contains("blob/main/LICENSE.txt", StringComparison.Ordinal) &&
-           markup.Contains("https://github.com/acentrist/MecchaCamouflage", StringComparison.Ordinal),
+           markup.Contains("https://github.com/airesein/MecchaCamouflage", StringComparison.Ordinal),
         "the footer must replace the redundant License link with the current WebView zoom percentage");
     Assert(app.Contains("message.name === \"zoomChanged\"", StringComparison.Ordinal) &&
            app.Contains("renderFooterZoom(message.data?.percent);", StringComparison.Ordinal),
@@ -5806,22 +5836,59 @@ static void ReusePaintRequestsDirectUvReplay()
         root, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
     var form = ReadRepositoryText(Path.Combine(
         root, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+    var index = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
     var app = ReadRepositoryText(Path.Combine(
         root, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
 
-    var reuseStart = host.IndexOf(
-        "public async Task<PaintTextureReuseResult> ReusePaintTextureAsync",
+    var startMethod = host.IndexOf(
+        "public async Task<PaintTextureReuseResult> StartReusePaintAsync",
+        StringComparison.Ordinal);
+    var stopPreviewMethod = host.IndexOf(
+        "public async Task<HostCommandResult> StopReusePaintPreviewAsync",
         StringComparison.Ordinal);
     var replayStart = host.IndexOf(
         "public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync",
         StringComparison.Ordinal);
-    Assert(reuseStart >= 0 && replayStart > reuseStart,
-        "HostSession must expose separate Reuse Paint and local replay methods");
-    var reuse = host[reuseStart..replayStart];
-    Assert(reuse.Contains("await ImportPaintTextureAsync(manifestPath", StringComparison.Ordinal),
-        "Reuse Paint must still perform the local .mcpaint import first");
-    Assert(reuse.Contains("await ReplayPaintTextureAsync(", StringComparison.Ordinal),
-        "Reuse Paint must run direct UV replay after the local import succeeds");
+    Assert(startMethod >= 0 && stopPreviewMethod > startMethod && replayStart > stopPreviewMethod,
+        "HostSession must expose separate Reuse Paint start, stop-preview, and direct replay methods");
+    var start = host[startMethod..stopPreviewMethod];
+    Assert(start.Contains("TryPreparePaintTextureSource", StringComparison.Ordinal) &&
+           host.Contains("PaintTextureArchive.Extract", StringComparison.Ordinal) &&
+           start.Contains("source.AlbedoPath", StringComparison.Ordinal) &&
+           start.Contains("source.PbrPath", StringComparison.Ordinal),
+        "Reuse Paint Start must extract the archive and replay its raw albedo/PBR files");
+    Assert(!start.Contains("ImportPaintTextureAsync(", StringComparison.Ordinal) &&
+           !start.Contains("ImportPaintTextureInternalAsync(", StringComparison.Ordinal),
+        "Reuse Paint Start must not perform a local import before replaying");
+    Assert(start.Contains("Settings.Image.BrushSizeTexels", StringComparison.Ordinal) &&
+           start.Contains("Settings.Image.ColorCompressionTolerance", StringComparison.Ordinal) &&
+           start.Contains("Math.Max(1, (int)(brushSizeTexels / 2.0))", StringComparison.Ordinal),
+        "Reuse Paint Start must use the Image brush size, derived step, and compression tolerance");
+    Assert(start.Contains("TryDeleteDirectory(source.TempDirectory)", StringComparison.Ordinal),
+        "Reuse Paint Start must clean the extracted temporary texture after the command response");
+    Assert(start.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
+        "Reuse Paint Start must run the direct UV replay");
+
+    var previewStart = host.IndexOf(
+        "public async Task<PaintTextureImportResult> PreviewPaintTextureAsync",
+        StringComparison.Ordinal);
+    var previewEnd = host.IndexOf(
+        "private async Task<PaintTextureImportResult> ImportPaintTextureInternalAsync",
+        previewStart,
+        StringComparison.Ordinal);
+    Assert(previewStart >= 0 && previewEnd > previewStart,
+        "HostSession must expose a separate Reuse Paint preview method");
+    var preview = host[previewStart..previewEnd];
+    Assert(preview.Contains("preservePreviewSnapshot: true", StringComparison.Ordinal) &&
+           preview.Contains("activePreviewKind = PaintKind.Reuse", StringComparison.Ordinal),
+        "Reuse Paint Preview must import locally while preserving the pre-preview snapshot");
+    var stopPreview = host[stopPreviewMethod..replayStart];
+    Assert(stopPreview.Contains("activePreviewKind != PaintKind.Reuse", StringComparison.Ordinal) &&
+           stopPreview.Contains("unpreviewOnly: true", StringComparison.Ordinal),
+        "Stop Preview must restore the snapshot through the existing unpreview path");
+    Assert(host.Contains("preview_only = preservePreviewSnapshot", StringComparison.Ordinal),
+        "the local import payload must request native preview snapshot preservation");
 
     var replayEnd = host.IndexOf(
         "private static (int TextureSize, int StrokeCount) ParseReplayMetadata",
@@ -5830,16 +5897,41 @@ static void ReusePaintRequestsDirectUvReplay()
     Assert(replayEnd > replayStart, "replay method boundary must remain discoverable");
     var replay = host[replayStart..replayEnd];
     Assert(replay.Contains("[\"type\"] = \"replay_paint_texture\"", StringComparison.Ordinal),
-        "Reuse Paint must send replay_paint_texture rather than only import_paint_texture");
+        "Reuse Paint must send replay_paint_texture");
+    Assert(replay.Contains("[\"albedo_path\"]", StringComparison.Ordinal) &&
+           replay.Contains("[\"pbr_path\"]", StringComparison.Ordinal),
+        "direct replay must send the extracted raw albedo and PBR paths");
+    Assert(replay.Contains("[\"color_compression_tolerance\"]", StringComparison.Ordinal) &&
+           replay.Contains("[\"step_texels\"]", StringComparison.Ordinal),
+        "direct replay must send the Image compression tolerance and derived step");
     Assert(replay.Contains("Runtime.SendPaintAsync", StringComparison.Ordinal),
         "direct UV replay must use the production paint command path");
     Assert(!replay.Contains("import_paint_texture", StringComparison.Ordinal),
-        "replay must read the game texture instead of using local import as its transport");
-    Assert(form.Contains("session.ReusePaintTextureAsync(manifestPath)", StringComparison.Ordinal),
-        "the Reuse Paint command must invoke import plus direct UV replay");
-    Assert(app.Contains("toast.image.export.replaying", StringComparison.Ordinal) &&
-           app.Contains("toast.image.export.reused", StringComparison.Ordinal),
-        "the web UI must show replay progress and a completion toast");
+        "replay must not use local import as its transport");
+
+    Assert(form.Contains("session.StartReusePaintAsync(manifestPath)", StringComparison.Ordinal) &&
+           form.Contains("session.PreviewPaintTextureAsync(manifestPath)", StringComparison.Ordinal) &&
+           form.Contains("session.StopReusePaintPreviewAsync()", StringComparison.Ordinal) &&
+           form.Contains("session.StopPaintAsync()", StringComparison.Ordinal),
+        "the Reuse Paint commands must invoke start, stop, preview, and stop-preview handlers");
+    Assert(form.Contains("TryReadPaintExportPath", StringComparison.Ordinal) &&
+           form.Contains("PaintTextureArchive.Extension", StringComparison.Ordinal) &&
+           form.Contains("\".json\"", StringComparison.Ordinal),
+        "the Reuse Paint commands must accept existing .mcpaint and legacy .json paths");
+    Assert(index.Contains("data-reuse-paint-command=\"start\"", StringComparison.Ordinal) &&
+           index.Contains("data-reuse-paint-command=\"stop\"", StringComparison.Ordinal) &&
+           index.Contains("data-reuse-paint-command=\"preview\"", StringComparison.Ordinal) &&
+           index.Contains("data-reuse-paint-command=\"stopPreview\"", StringComparison.Ordinal) &&
+           !index.Contains("id=\"image-reuse-paint\"", StringComparison.Ordinal),
+        "the web UI must replace the single Reuse Paint button with the four actions");
+    Assert(app.Contains("function renderReusePaintControls()", StringComparison.Ordinal) &&
+           app.Contains("reusePaintStart", StringComparison.Ordinal) &&
+           app.Contains("reusePaintPreview", StringComparison.Ordinal) &&
+           app.Contains("reusePaintStopPreview", StringComparison.Ordinal) &&
+           app.Contains("toast.image.export.replaying", StringComparison.Ordinal) &&
+           app.Contains("toast.image.export.reused", StringComparison.Ordinal) &&
+           app.Contains("toast.image.export.previewed", StringComparison.Ordinal),
+        "the web UI must enable the four Reuse Paint actions and show progress and completion toasts");
 }
 
 static void NativeReplaySamplesUvTextureDirectly()
@@ -5863,11 +5955,24 @@ static void NativeReplaySamplesUvTextureDirectly()
         StringComparison.Ordinal);
     Assert(start >= 0 && end > start, "native replay handler must remain discoverable");
     var body = bridge[start..end];
-    Assert(body.Contains("mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo)", StringComparison.Ordinal),
-        "replay must read the current albedo texture");
-    Assert(body.Contains("sdk::EPaintChannel::Metallic", StringComparison.Ordinal),
-        "replay must read the packed PBR texture");
-    Assert(!body.Contains("albedo.bytes[offset + 3U] == 0U", StringComparison.Ordinal),
+    Assert(body.Contains("json_string_field(request, \"albedo_path\"", StringComparison.Ordinal) &&
+           body.Contains("json_string_field(request, \"pbr_path\"", StringComparison.Ordinal) &&
+           body.Contains("read_binary_file_w(utf8_to_wstring(albedo_path)", StringComparison.Ordinal) &&
+           body.Contains("read_binary_file_w(utf8_to_wstring(pbr_path)", StringComparison.Ordinal),
+        "replay must read the provided raw albedo and PBR files when present");
+    Assert(body.Contains("mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo)", StringComparison.Ordinal) &&
+           body.Contains("sdk::EPaintChannel::Metallic", StringComparison.Ordinal),
+        "replay must retain the current-game-texture fallback");
+    Assert(body.Contains("image_paint_brush_size_texels", StringComparison.Ordinal) &&
+           body.Contains("default_step_texels = std::max(1, brush_size_texels / 2)", StringComparison.Ordinal),
+        "replay must follow the Image brush size and derive the default grid step from it");
+    Assert(body.Contains("color_compression_tolerance", StringComparison.Ordinal) &&
+           body.Contains("image_paint_color_compression_tolerance", StringComparison.Ordinal) &&
+           body.Contains("within_previous_color", StringComparison.Ordinal) &&
+           body.Contains("compression_threshold", StringComparison.Ordinal),
+        "replay must skip only texels within the Image color-compression tolerance of the previous stroke");
+    Assert(!body.Contains("albedo.bytes[offset + 3U]", StringComparison.Ordinal) &&
+           body.Contains("replay_alpha_skipping", StringComparison.Ordinal),
         "replay must not drop texels based on the paint texture alpha");
     Assert(body.Contains("albedo.bytes[offset]", StringComparison.Ordinal) &&
            body.Contains("packed_pbr.bytes[offset]", StringComparison.Ordinal),
@@ -5881,12 +5986,28 @@ static void NativeReplaySamplesUvTextureDirectly()
         "replay strokes must use Override apply mode");
     Assert(body.Contains("texture_size_denominator", StringComparison.Ordinal),
         "replay must map texture texels directly to UV without the 4-face image path");
-    Assert(!body.Contains("image_paint", StringComparison.Ordinal) &&
+    Assert(!body.Contains("image_paint_enabled", StringComparison.Ordinal) &&
            !body.Contains("front_region_mode", StringComparison.Ordinal),
         "direct UV replay must not reuse the 4-face Image Paint planner");
     Assert(bridge.Contains("sdk_call_paint_at_uv_with_brush", StringComparison.Ordinal) &&
            bridge.Contains("PaintAtUVWithBrush", StringComparison.Ordinal),
         "replay must keep the game's PaintAtUVWithBrush production route");
+
+    var importStart = bridge.LastIndexOf(
+        "auto import_paint_texture_on_game_thread",
+        StringComparison.Ordinal);
+    var importEnd = bridge.IndexOf(
+        "auto is_export_paint_texture_request",
+        importStart,
+        StringComparison.Ordinal);
+    Assert(importStart >= 0 && importEnd > importStart,
+        "native import handler must remain discoverable");
+    var import = bridge[importStart..importEnd];
+    Assert(import.Contains("preview_only", StringComparison.Ordinal) &&
+           import.Contains("mesh_first_store_preview_snapshot", StringComparison.Ordinal) &&
+           import.Contains("mesh_first_export_channel_bytes", StringComparison.Ordinal) &&
+           import.Contains("mesh_first_clear_preview_snapshot", StringComparison.Ordinal),
+        "Reuse Paint Preview must preserve the pre-preview texture snapshot before importing");
 }
 
 static string FindRepositoryRoot()

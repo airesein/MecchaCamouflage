@@ -17,15 +17,29 @@ surface.
 
 ## Reuse Paint
 
-Reuse Paint performs two steps. It first imports the `.mcpaint` archive locally
-so Preview/Unpreview can see the saved material, then sends
-`replay_paint_texture`. The bridge reads the current game Albedo and packed PBR
-textures, samples them on a UV grid (direct `v`, no image-editor flip), skips
-fully transparent texels, converts sRGB albedo to linear, and submits
-`PaintAtUVWithBrush` strokes for channel 7 through the normal async paint job.
-The local import is never the production replication transport. Direct UV
-replay requires the same body and UV layout that produced the export, and its
-duration grows with the texel grid; brush size and step are request options.
+Reuse Paint has separate Start, Stop, Preview, and Stop Preview controls.
+Start extracts the `.mcpaint` archive to a temporary directory and sends
+`replay_paint_texture` with the extracted `albedo.rgba` and `pbr.rgba` paths.
+The bridge reads those raw files synchronously before queueing the async job, so
+the temporary directory can be deleted as soon as the command returns. Raw
+texture replay never performs a local import and never displays the final
+texture up front: only the gradually submitted strokes appear. When no raw
+paths are supplied, the bridge retains the current-game-texture fallback for
+backward compatibility and internal use.
+
+Replay samples the texture on a UV grid (direct `v`, no image-editor flip) and
+uses the image brush size for the stroke radius. The default grid step is
+`max(1, brush_size_texels / 2)` unless the request supplies `step_texels`. The
+image color-compression tolerance skips a texel only when its albedo and PBR are
+within tolerance of the previously emitted stroke. Replay never drops texels
+because of alpha; the exported paint alpha is zero. Strokes use
+`sRGB -> linear` albedo and channel 7 through `PaintAtUVWithBrush`.
+
+Preview locally imports the archive and preserves the pre-preview material
+snapshot through the existing Preview/Unpreview mechanism. Stop Preview restores
+that snapshot. The local import is never the production replication transport.
+Direct UV replay requires the same body and UV layout that produced the export,
+and its duration grows with the texel grid.
 
 ## Queue telemetry and completion
 

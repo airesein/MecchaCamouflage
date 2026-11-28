@@ -129,13 +129,20 @@ performance captures.
 not become a production paint fallback, and neither a packed RPC nor the old
 internal no-resend / receiver-queue routes may be reintroduced.
 
-Reuse Paint is a production paint operation. It imports the saved `.mcpaint`
-locally for Preview/Unpreview compatibility, then issues `replay_paint_texture`.
-The bridge reads the live Albedo and packed PBR textures, samples them directly
-in UV space on a texel grid, skips fully transparent pixels, and submits the
-resulting channel-7 strokes through `PaintAtUVWithBrush` and the normal async
-job. It does not use `ImportChannelFromBytes` as the paint transport and does
-not route through the four-face Image Paint planner. Reuse requires the same
+Reuse Paint is a production paint operation with Start, Stop, Preview, and Stop
+Preview controls. Start extracts the saved `.mcpaint` archive to a temporary
+directory and issues `replay_paint_texture` with the raw `albedo.rgba` and
+`pbr.rgba` paths. The bridge reads those files before it creates the async job,
+then samples them directly in UV space on a texel grid and submits channel-7
+strokes through `PaintAtUVWithBrush` and the normal async job. The current game
+texture remains only as a legacy/internal fallback when raw paths are absent.
+
+Replay does not skip texels by alpha, because the paint alpha is zero. It uses
+the Image brush size, derives the default step from it, and applies the Image
+color-compression tolerance only to texels whose albedo and PBR match the
+previous emitted stroke. Preview performs a local import and stores the
+pre-preview material snapshot; Stop Preview restores it. Start never imports
+locally and never shows the final texture immediately. Reuse requires the same
 body and UV layout as the export; it may take time proportional to the texture
 grid, so keep the existing paint progress and cancellation paths active.
 

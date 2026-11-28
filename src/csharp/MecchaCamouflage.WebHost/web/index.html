@@ -126,12 +126,18 @@
                     <button id="image-preset-load" class="image-edit-control" type="button" data-i18n="button.load.preset">Load</button>
                     <button id="image-preset-save" class="image-edit-control" type="button" data-i18n="button.save.preset">Save</button>
                     <button id="image-export-paint" class="image-edit-control image-transfer-control" type="button" data-i18n="button.export.paint">Export Paint</button>
-                    <button id="image-reuse-paint" class="image-edit-control image-transfer-control" type="button" data-i18n="button.reuse.paint" disabled>Reuse Paint</button>
                   </div>
                   <label class="field image-export-path-field">
                     <span data-i18n="label.export.path">Saved at</span>
                     <input id="image-export-path" class="image-edit-control image-transfer-control" type="text" data-i18n-aria-label="aria.image.export.path">
                   </label>
+                  <div class="action-bar reuse-paint-grid">
+                    <div class="manual-paint-label" data-i18n="button.reuse.paint">Reuse Paint</div>
+                    <button id="image-reuse-start" class="image-transfer-control" type="button" data-reuse-paint-command="start" data-i18n="button.start" disabled>Start</button>
+                    <button id="image-reuse-stop" class="image-transfer-control danger-action" type="button" data-reuse-paint-command="stop" data-i18n="button.stop" disabled>Stop</button>
+                    <button id="image-reuse-preview" class="image-transfer-control" type="button" data-reuse-paint-command="preview" data-i18n="button.preview" disabled>Preview</button>
+                    <button id="image-reuse-stop-preview" class="image-transfer-control" type="button" data-reuse-paint-command="stopPreview" data-i18n="button.stop.preview" disabled>Stop Preview</button>
+                  </div>
                   <div class="image-choice-list">
                     <span class="field-label" title="Changes the game surface mapping; it does not move the image in the atlas." data-i18n="image.body.type" data-i18n-title="aria.image.body.type">Body type</span><div class="region-choice image-choice" role="group" aria-label="Body type" data-i18n-aria-label="aria.image.body.type">
                       <button id="image-guide-round" class="image-edit-control active" type="button" data-i18n="body.round">Round</button>
@@ -363,7 +369,7 @@
     <div>
       <span id="footer-zoom">100%</span>
       <span>|</span>
-      <a href="https://github.com/acentrist/MecchaCamouflage" data-i18n="link.github">GitHub</a>
+      <a href="https://github.com/airesein/MecchaCamouflage" data-i18n="link.github">GitHub</a>
       <span>|</span>
       <span id="version">dev</span>
     </div>

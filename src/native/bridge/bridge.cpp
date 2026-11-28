@@ -1,4 +1,4 @@
-﻿#ifndef NOMINMAX
+#ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #define WIN32_LEAN_AND_MEAN
@@ -24108,13 +24108,25 @@ namespace
 
         const int requested_texture_size =
             json_int_field(request, "texture_size", 0, 0, 8192);
+        const double requested_brush_size_texels =
+            json_number_field(
+                request,
+                "brush_size_texels",
+                json_number_field(request, "image_paint_brush_size_texels", 5.0));
         const int brush_size_texels = static_cast<int>(
-            std::lround(clamp_range(
-                json_number_field(request, "brush_size_texels", 6.0),
-                1.0,
-                64.0)));
+            std::lround(clamp_range(requested_brush_size_texels, 1.0, 64.0)));
+        const int default_step_texels = std::max(1, brush_size_texels / 2);
         const int step_texels =
-            json_int_field(request, "step_texels", 3, 1, 256);
+            json_int_field(request, "step_texels", default_step_texels, 1, 256);
+        const double color_compression_tolerance = clamp_range(
+            json_number_field(
+                request,
+                "color_compression_tolerance",
+                json_number_field(request, "image_paint_color_compression_tolerance", 0.0)),
+            0.0,
+            10.0);
+        const auto albedo_path = json_string_field(request, "albedo_path", "");
+        const auto pbr_path = json_string_field(request, "pbr_path", "");
         const auto body_type =
             lower_copy(json_string_field(request, "body_type", ""));
 
@@ -24123,6 +24135,10 @@ namespace
         metadata += ",\"local_texture_import_required\":false";
         metadata += ",\"brush_size_texels\":" + std::to_string(brush_size_texels);
         metadata += ",\"step_texels\":" + std::to_string(step_texels);
+        metadata += ",\"color_compression_tolerance\":" +
+                    std::to_string(color_compression_tolerance);
+        metadata += ",\"raw_texture_replay\":" +
+                    std::string(json_bool(!albedo_path.empty() || !pbr_path.empty()));
         metadata += ",\"body_type\":\"" + json_escape(body_type) + "\"";
 
         Reflection ref{};
@@ -24166,10 +24182,57 @@ namespace
         }
         metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
 
-        const auto albedo =
-            mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
-        const auto packed_pbr =
-            mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Metallic);
+        MeshFirstChannelBytes albedo{};
+        MeshFirstChannelBytes packed_pbr{};
+        const bool has_raw_texture_paths =
+            !albedo_path.empty() || !pbr_path.empty();
+        if (has_raw_texture_paths)
+        {
+            if (albedo_path.empty() || pbr_path.empty())
+            {
+                return response_json(false,
+                                     "replay_paint_texture_paths_invalid",
+                                     0,
+                                     1,
+                                     "albedo_path and pbr_path must be provided together",
+                                     metadata);
+            }
+            std::vector<std::uint8_t> albedo_bytes{};
+            std::vector<std::uint8_t> pbr_bytes{};
+            if (!read_binary_file_w(utf8_to_wstring(albedo_path), albedo_bytes))
+            {
+                return response_json(false,
+                                     "replay_paint_texture_albedo_unreadable",
+                                     0,
+                                     1,
+                                     "could not read the provided albedo texture",
+                                     metadata + ",\"albedo_path\":\"" +
+                                         json_escape(albedo_path) + "\"");
+            }
+            if (!read_binary_file_w(utf8_to_wstring(pbr_path), pbr_bytes))
+            {
+                return response_json(false,
+                                     "replay_paint_texture_pbr_unreadable",
+                                     0,
+                                     1,
+                                     "could not read the provided packed PBR texture",
+                                     metadata + ",\"pbr_path\":\"" +
+                                         json_escape(pbr_path) + "\"");
+            }
+            albedo = {true, albedo_bytes, ""};
+            packed_pbr = {true, pbr_bytes, ""};
+            metadata += ",\"texture_source\":\"provided_raw_rgba\"";
+            metadata += ",\"albedo_path\":\"" + json_escape(albedo_path) + "\"";
+            metadata += ",\"pbr_path\":\"" + json_escape(pbr_path) + "\"";
+        }
+        else
+        {
+            albedo =
+                mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo);
+            packed_pbr =
+                mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Metallic);
+            metadata += ",\"texture_source\":\"current_game_texture\"";
+        }
         metadata += ",\"albedo_ok\":" + std::string(json_bool(albedo.ok));
         metadata += ",\"albedo_failure\":\"" + json_escape(albedo.failure) + "\"";
         metadata += ",\"pbr_ok\":" + std::string(json_bool(packed_pbr.ok));
@@ -24191,7 +24254,7 @@ namespace
                                  "replay_paint_texture_layout_mismatch",
                                  0,
                                  1,
-                                 "the current paint texture has incompatible RGBA channels",
+                                 "the paint texture has incompatible RGBA channels",
                                  metadata);
         }
         const std::size_t pixel_count = albedo.bytes.size() / 4U;
@@ -24206,7 +24269,7 @@ namespace
                                  "replay_paint_texture_not_square",
                                  0,
                                  1,
-                                 "the current paint texture is not a square RGBA image",
+                                 "the paint texture is not a square RGBA image",
                                  metadata);
         }
         if (requested_texture_size > 0 && requested_texture_size != texture_size)
@@ -24248,7 +24311,16 @@ namespace
         const int grid_width = (texture_size + step_texels - 1) / step_texels;
         strokes.reserve(static_cast<std::size_t>(grid_width) *
                         static_cast<std::size_t>(grid_width));
-        int transparent_skipped = 0;
+        const bool compression_enabled = color_compression_tolerance > 0.0;
+        const double compression_threshold = color_compression_tolerance / 100.0;
+        int color_compression_skipped = 0;
+        bool has_previous_stroke_color = false;
+        double previous_r = 0.0;
+        double previous_g = 0.0;
+        double previous_b = 0.0;
+        double previous_metallic = 0.0;
+        double previous_roughness = 0.0;
+        double previous_emissive = 0.0;
         for (int y = 0; y < texture_size; y += step_texels)
         {
             const double v =
@@ -24274,6 +24346,20 @@ namespace
                     static_cast<double>(packed_pbr.bytes[offset + 1U]) / 255.0;
                 const double emissive =
                     static_cast<double>(packed_pbr.bytes[offset + 2U]) / 255.0;
+                const bool within_previous_color =
+                    compression_enabled && has_previous_stroke_color &&
+                    std::max({std::abs(r - previous_r),
+                              std::abs(g - previous_g),
+                              std::abs(b - previous_b),
+                              std::abs(metallic - previous_metallic),
+                              std::abs(roughness - previous_roughness),
+                              std::abs(emissive - previous_emissive)}) <=
+                        compression_threshold;
+                if (within_previous_color)
+                {
+                    ++color_compression_skipped;
+                    continue;
+                }
                 const auto channel = sdk_make_channel(
                     runtime_contract::appearance_srgb_to_linear(r),
                     runtime_contract::appearance_srgb_to_linear(g),
@@ -24288,10 +24374,21 @@ namespace
                     channel,
                     brush,
                     sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
+                previous_r = r;
+                previous_g = g;
+                previous_b = b;
+                previous_metallic = metallic;
+                previous_roughness = roughness;
+                previous_emissive = emissive;
+                has_previous_stroke_color = true;
             }
         }
         metadata += ",\"replay_strokes_total\":" + std::to_string(strokes.size());
-        metadata += ",\"replay_transparent_skipped\":" + std::to_string(transparent_skipped);
+        metadata += ",\"replay_color_compression_enabled\":" +
+                    std::string(json_bool(compression_enabled));
+        metadata += ",\"replay_color_compression_skipped\":" +
+                    std::to_string(color_compression_skipped);
+        metadata += ",\"replay_alpha_skipping\":false";
         metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
         metadata += ",\"local_route_mode\":\"native_recorded_paint\"";
         metadata += ",\"paint_target_channel\":\"albedo_metallic_roughness_emissive\"";
@@ -24302,7 +24399,7 @@ namespace
                                  "replay_paint_texture_empty",
                                  0,
                                  1,
-                                 "the current paint texture produced no opaque replay strokes",
+                                 "the paint texture produced no replay strokes",
                                  metadata);
         }
 
@@ -29220,10 +29317,64 @@ namespace
             static_cast<std::size_t>(texture_size) * 4U;
         std::vector<std::uint8_t> albedo{};
         std::vector<std::uint8_t> packed_pbr{};
+        const bool preview_only = json_bool_field(request, "preview_only", false);
         std::string metadata = "\"route\":\"import_paint_texture\"";
         metadata += ",\"local_only\":true,\"replicated\":false";
         metadata += ",\"texture_size\":" + std::to_string(texture_size);
         metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
+        metadata += ",\"preview_only\":" + std::string(json_bool(preview_only));
+        bool store_preview_snapshot = false;
+        MeshFirstChannelBytes preview_albedo{};
+        MeshFirstChannelBytes preview_metallic{};
+        MeshFirstChannelBytes preview_roughness{};
+        MeshFirstChannelBytes preview_emissive{};
+        if (preview_only)
+        {
+            auto existing_snapshot = mesh_first_preview_snapshot_copy();
+            if (existing_snapshot.available &&
+                existing_snapshot.component == ctx.component)
+            {
+                metadata += ",\"preview_snapshot_reused\":true";
+            }
+            else
+            {
+                if (existing_snapshot.available)
+                {
+                    metadata += ",\"preview_expired_snapshot_component\":\"" +
+                                hex_address(existing_snapshot.component) + "\"";
+                    mesh_first_clear_preview_snapshot();
+                }
+                preview_albedo = mesh_first_export_channel_bytes(
+                    ref, ctx.component, sdk::EPaintChannel::Albedo);
+                preview_metallic = mesh_first_export_channel_bytes(
+                    ref, ctx.component, sdk::EPaintChannel::Metallic);
+                preview_roughness = mesh_first_export_channel_bytes(
+                    ref, ctx.component, sdk::EPaintChannel::Roughness);
+                preview_emissive = mesh_first_export_channel_bytes(
+                    ref, ctx.component, sdk::EPaintChannel::Emissive);
+                metadata += ",\"preview_snapshot_reused\":false";
+                if (!preview_albedo.ok || !preview_metallic.ok ||
+                    !preview_roughness.ok || !preview_emissive.ok)
+                {
+                    const std::string preview_failure =
+                        !preview_albedo.ok
+                            ? "albedo_export_failed:" + preview_albedo.failure
+                            : !preview_metallic.ok
+                                  ? "metallic_export_failed:" + preview_metallic.failure
+                                  : !preview_roughness.ok
+                                        ? "roughness_export_failed:" + preview_roughness.failure
+                                        : "emissive_export_failed:" + preview_emissive.failure;
+                    return response_json(false,
+                                         "import_paint_texture_preview_export_failed",
+                                         0,
+                                         1,
+                                         "local preview texture export failed: " +
+                                             preview_failure,
+                                         metadata);
+                }
+                store_preview_snapshot = true;
+            }
+        }
         if (!read_binary_file_w(utf8_to_wstring(albedo_path), albedo))
         {
             return response_json(false,
@@ -29287,11 +29438,26 @@ namespace
                     std::string(json_bool(verify_albedo.ok && verify_albedo.bytes == albedo));
         metadata += ",\"verify_pbr_ok\":" +
                     std::string(json_bool(verify_metallic.ok && verify_metallic.bytes == packed_pbr));
+        if (preview_only && store_preview_snapshot)
+        {
+            mesh_first_store_preview_snapshot(ctx.component,
+                                              texture_size,
+                                              preview_albedo.bytes,
+                                              preview_metallic.bytes,
+                                              preview_roughness.bytes,
+                                              preview_emissive.bytes);
+            metadata += ",\"preview_snapshot_stored\":true";
+        }
+        else
+        {
+            metadata += ",\"preview_snapshot_stored\":false";
+        }
         return response_json(true,
                              "import_paint_texture",
                              0,
                              0,
-                             "paint texture imported locally",
+                             preview_only ? "paint texture preview imported locally"
+                                          : "paint texture imported locally",
                              metadata);
     }
 
