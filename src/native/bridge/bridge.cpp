@@ -24113,30 +24113,19 @@ namespace
                 request,
                 "brush_size_texels",
                 json_number_field(request, "image_paint_brush_size_texels", 5.0));
-        const int brush_size_texels = static_cast<int>(
-            std::lround(clamp_range(requested_brush_size_texels, 1.0, 64.0)));
-        const int default_step_texels = std::max(1, brush_size_texels / 2);
-        const int step_texels =
-            json_int_field(request, "step_texels", default_step_texels, 1, 256);
-        const double color_compression_tolerance = clamp_range(
-            json_number_field(
-                request,
-                "color_compression_tolerance",
-                json_number_field(request, "image_paint_color_compression_tolerance", 0.0)),
-            0.0,
-            10.0);
+        const double brush_size_texels =
+            clamp_range(requested_brush_size_texels, 1.0, 10.0);
         const auto albedo_path = json_string_field(request, "albedo_path", "");
         const auto pbr_path = json_string_field(request, "pbr_path", "");
         const auto body_type =
             lower_copy(json_string_field(request, "body_type", ""));
 
         std::string metadata = "\"route\":\"replay_paint_texture\"";
-        metadata += ",\"replay_route\":\"direct_uv_texture_replay\"";
+        metadata += ",\"replay_route\":\"mesh_surface_uv_texture_replay\"";
         metadata += ",\"local_texture_import_required\":false";
         metadata += ",\"brush_size_texels\":" + std::to_string(brush_size_texels);
-        metadata += ",\"step_texels\":" + std::to_string(step_texels);
-        metadata += ",\"color_compression_tolerance\":" +
-                    std::to_string(color_compression_tolerance);
+        metadata += ",\"color_compression_applied\":false";
+        metadata += ",\"alpha_skipping\":false";
         metadata += ",\"raw_texture_replay\":" +
                     std::string(json_bool(!albedo_path.empty() || !pbr_path.empty()));
         metadata += ",\"body_type\":\"" + json_escape(body_type) + "\"";
@@ -24287,6 +24276,179 @@ namespace
         metadata += ",\"texture_size\":" + std::to_string(texture_size);
         metadata += ",\"texture_pixels\":" + std::to_string(pixel_count);
 
+        // Reuse Paint replays through the same runtime mesh surface sampling
+        // that Image Paint uses. The 4-face image and canonical atlas are not
+        // involved: every plan sample is a real point on a live mesh triangle
+        // and carries the UV from RuntimePaintable's verified triangle cache.
+        paint_dispatch_set_debug_stage(PaintDispatchDebugStage::DiscoverMesh);
+        const auto mesh_candidates = sdk_collect_front_mesh_candidates(ref, ctx);
+        if (mesh_candidates.empty())
+        {
+            return response_json(false,
+                                 "mesh_component_unavailable",
+                                 0,
+                                 1,
+                                 "no live skeletal mesh component candidate was found",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        SdkFrontMeshCandidate selected_mesh{};
+        if (!sdk_select_profile_mesh_candidate(ref, mesh_candidates, selected_mesh))
+        {
+            return response_json(false,
+                                 "mesh_profile_runtime_identity_mismatch",
+                                 0,
+                                 1,
+                                 "no live mesh candidate matched a required mesh profile",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        metadata += ",\"selected_mesh\":\"" + hex_address(selected_mesh.mesh) + "\"";
+        metadata += ",\"selected_mesh_name\":\"" +
+                    json_escape(ref.object_name(selected_mesh.mesh)) + "\"";
+        metadata += ",\"selected_mesh_source\":\"" +
+                    json_escape(selected_mesh.source) + "\"";
+
+        paint_dispatch_set_debug_stage(PaintDispatchDebugStage::LoadProfile);
+        const auto profile_catalog = load_mesh_first_profile_catalog();
+        MeshFirstProfile profile{};
+        std::string profile_failure{};
+        const bool profile_available =
+            select_mesh_first_profile_for_candidate(ref,
+                                                    profile_catalog,
+                                                    selected_mesh,
+                                                    profile,
+                                                    profile_failure);
+        if (!profile_available)
+        {
+            const std::string profile_stage =
+                profile_catalog.empty() ? "mesh_profile_missing"
+                                        : "mesh_profile_identity_mismatch";
+            return response_json(false,
+                                 profile_stage.c_str(),
+                                 0,
+                                 1,
+                                 "mesh profile is required; dynamic runtime scan fallback is disabled",
+                                 metadata + ",\"mesh_profile_failure\":\"" +
+                                     json_escape(profile_failure) +
+                                     "\",\"replay_blocked\":true");
+        }
+        metadata += ",";
+        metadata += mesh_first_profile_metadata(profile);
+        metadata += ",\"mesh_identity_match\":true";
+        const int active_texture_size =
+            profile.texture_size > 0 ? profile.texture_size : texture_size;
+        metadata += ",\"mesh_sample_texture_size\":" +
+                    std::to_string(active_texture_size);
+
+        const auto viewport = sdk_get_viewport_info(ref, ctx);
+        sdk::FVector camera_location{};
+        sdk::FVector camera_direction{};
+        if (viewport.width > 0 && viewport.height > 0)
+        {
+            const auto center_ray =
+                sdk_deproject_screen_position(
+                    ref,
+                    ctx,
+                    static_cast<double>(viewport.width) * 0.5,
+                    static_cast<double>(viewport.height) * 0.5);
+            if (center_ray.ok && sdk_vec_len(center_ray.direction) > 0.000001)
+            {
+                camera_location = center_ray.location;
+                camera_direction = sdk_vec_normalize(center_ray.direction);
+                metadata += ",\"camera_direction_x\":" +
+                            std::to_string(camera_direction.X);
+                metadata += ",\"camera_direction_y\":" +
+                            std::to_string(camera_direction.Y);
+                metadata += ",\"camera_direction_z\":" +
+                            std::to_string(camera_direction.Z);
+            }
+        }
+        metadata += ",\"viewport_width\":" + std::to_string(viewport.width);
+        metadata += ",\"viewport_height\":" + std::to_string(viewport.height);
+
+        paint_dispatch_set_debug_stage(
+            PaintDispatchDebugStage::ResolveRuntimeTriangles);
+        MeshFirstRuntimeTriangleCache runtime_triangle_cache =
+            mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
+        if (!runtime_triangle_cache.ok && viewport.width > 0 &&
+            viewport.height > 0)
+        {
+            paint_dispatch_set_debug_stage(
+                PaintDispatchDebugStage::WarmRuntimeTriangles);
+            mesh_first_warm_runtime_paint_cache(
+                ref,
+                ctx,
+                selected_mesh.mesh,
+                viewport,
+                "replay_runtime_triangle_cache_unavailable");
+            runtime_triangle_cache =
+                mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
+        }
+        metadata += ",\"runtime_triangle_cache_used\":" +
+                    std::string(json_bool(runtime_triangle_cache.ok));
+        metadata += ",\"runtime_triangle_cache_mode\":\"profile_verified\"";
+        metadata += ",\"runtime_triangle_cache_triangles\":" +
+                    std::to_string(runtime_triangle_cache.triangle_count);
+        metadata += ",\"runtime_triangle_cache_failure\":\"" +
+                    json_escape(runtime_triangle_cache.failure) + "\"";
+        if (!runtime_triangle_cache.ok)
+        {
+            return response_json(false,
+                                 runtime_triangle_cache.failure.empty()
+                                     ? "runtime_triangle_cache_unavailable"
+                                     : runtime_triangle_cache.failure.c_str(),
+                                 0,
+                                 1,
+                                 "RuntimePaintable cached current triangles are unavailable; Reuse Paint cannot sample the mesh safely",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        const char region_axis = mesh_first_region_axis(profile);
+        metadata += ",\"mesh_region_axis\":\"" +
+                    std::string(mesh_first_region_axis_label(region_axis)) + "\"";
+        metadata += ",\"mesh_region_axis_selection\":\"profile_min_horizontal_extent\"";
+
+        paint_dispatch_set_debug_stage(PaintDispatchDebugStage::BuildPlanner);
+        std::vector<MeshFirstPlanSample> plan_samples{};
+        MeshFirstPlanStats plan_stats{};
+        std::string planner_failure{};
+        // Image Paint uses the Image brush size as its surface coverage step.
+        // Reuse Paint therefore emits one stroke per generated mesh sample
+        // instead of walking a texture-space grid, so UV islands and the mesh
+        // silhouette receive the same coverage as Image Paint.
+        const bool sample_gen_ok =
+            mesh_first_generate_plan_samples_from_runtime_cache(
+                &profile,
+                runtime_triangle_cache.triangles,
+                active_texture_size,
+                camera_location,
+                camera_direction,
+                region_axis,
+                brush_size_texels,
+                plan_samples,
+                plan_stats,
+                planner_failure);
+        metadata += ",";
+        metadata += mesh_first_plan_stats_metadata(plan_stats);
+        metadata += ",\"replay_sample_source\":\"mesh_first_runtime_triangle_plan\"";
+        metadata += ",\"replay_plan_samples\":" +
+                    std::to_string(plan_samples.size());
+        metadata += ",\"replay_sample_spacing_texels\":" +
+                    std::to_string(brush_size_texels);
+        if (!sample_gen_ok)
+        {
+            return response_json(false,
+                                 planner_failure.empty()
+                                     ? "planner_build_failed"
+                                     : planner_failure.c_str(),
+                                 0,
+                                 1,
+                                 "Reuse Paint could not build a mesh surface sample plan",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+        {
+            return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+        }
+
         sdk::FRuntimeBrushSettings base_brush{};
         safe_copy(&base_brush,
                   reinterpret_cast<const void*>(
@@ -24299,58 +24461,100 @@ namespace
         base_brush.Falloff = sdk::EBrushFalloff::Spherical;
         base_brush.BlendMode = sdk::EPaintBlendMode::Normal;
         sdk::FRuntimeBrushSettings brush = base_brush;
-        const double texture_size_denominator =
-            static_cast<double>(std::max(1, texture_size - 1));
         const double brush_radius_uv =
             static_cast<double>(brush_size_texels) /
-            static_cast<double>(std::max(1, texture_size));
+            static_cast<double>(std::max(1, active_texture_size));
         brush.Radius = static_cast<float>(brush_radius_uv);
         metadata += ",\"brush_radius_uv\":" + std::to_string(brush_radius_uv);
 
+        // Direct raw UV indexing with edge clamping and bilinear filtering. The
+        // saved texture uses the game texture's UV orientation, so v is not
+        // flipped. Alpha is sampled but never used to skip a mesh sample.
+        const auto sample_raw_texture =
+            [](const std::vector<std::uint8_t>& bytes,
+               int size,
+               double u,
+               double v,
+               std::array<double, 4>& out) {
+                out = {0.0, 0.0, 0.0, 1.0};
+                if (bytes.empty() || size <= 0)
+                {
+                    return;
+                }
+                const double max_coord =
+                    static_cast<double>(std::max(1, size - 1));
+                const double sample_x = clamp01(u) * max_coord;
+                const double sample_y = clamp01(v) * max_coord;
+                const double base_x = std::floor(sample_x);
+                const double base_y = std::floor(sample_y);
+                const int x0 = std::max(
+                    0, std::min(size - 1, static_cast<int>(base_x)));
+                const int y0 = std::max(
+                    0, std::min(size - 1, static_cast<int>(base_y)));
+                const int x1 = std::max(0, std::min(size - 1, x0 + 1));
+                const int y1 = std::max(0, std::min(size - 1, y0 + 1));
+                const double tx = sample_x - base_x;
+                const double ty = sample_y - base_y;
+                const auto texel = [&](int x, int y, int channel) {
+                    const std::size_t offset =
+                        (static_cast<std::size_t>(y) *
+                             static_cast<std::size_t>(size) +
+                         static_cast<std::size_t>(x)) *
+                            4U +
+                        static_cast<std::size_t>(channel);
+                    return offset < bytes.size()
+                               ? static_cast<double>(bytes[offset]) / 255.0
+                               : 0.0;
+                };
+                for (int channel = 0; channel < 4; ++channel)
+                {
+                    const double top =
+                        texel(x0, y0, channel) * (1.0 - tx) +
+                        texel(x1, y0, channel) * tx;
+                    const double bottom =
+                        texel(x0, y1, channel) * (1.0 - tx) +
+                        texel(x1, y1, channel) * tx;
+                    out[static_cast<std::size_t>(channel)] =
+                        top * (1.0 - ty) + bottom * ty;
+                }
+            };
+
         std::vector<sdk::FPaintStroke> strokes{};
-        const int grid_width = (texture_size + step_texels - 1) / step_texels;
-        strokes.reserve(static_cast<std::size_t>(grid_width) *
-                        static_cast<std::size_t>(grid_width));
-        for (int y = 0; y < texture_size; y += step_texels)
+        strokes.reserve(plan_samples.size());
+        for (std::size_t sample_index = 0;
+             sample_index < plan_samples.size();
+             ++sample_index)
         {
-            const double v =
-                static_cast<double>(y) / texture_size_denominator;
-            for (int x = 0; x < texture_size; x += step_texels)
+            if ((sample_index % 512) == 0 &&
+                queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
             {
-                const std::size_t offset =
-                    (static_cast<std::size_t>(y) *
-                         static_cast<std::size_t>(texture_size) +
-                     static_cast<std::size_t>(x)) *
-                    4U;
-                const double u =
-                    static_cast<double>(x) / texture_size_denominator;
-                const double r =
-                    static_cast<double>(albedo.bytes[offset]) / 255.0;
-                const double g =
-                    static_cast<double>(albedo.bytes[offset + 1U]) / 255.0;
-                const double b =
-                    static_cast<double>(albedo.bytes[offset + 2U]) / 255.0;
-                const double metallic =
-                    static_cast<double>(packed_pbr.bytes[offset]) / 255.0;
-                const double roughness =
-                    static_cast<double>(packed_pbr.bytes[offset + 1U]) / 255.0;
-                const double emissive =
-                    static_cast<double>(packed_pbr.bytes[offset + 2U]) / 255.0;
-                const auto channel = sdk_make_channel(
-                    runtime_contract::appearance_srgb_to_linear(r),
-                    runtime_contract::appearance_srgb_to_linear(g),
-                    runtime_contract::appearance_srgb_to_linear(b),
-                    metallic,
-                    roughness,
-                    emissive,
-                    sdk::EPaintChannelApplyMode::Override);
-                strokes.push_back(sdk_make_uv_stroke(
-                    u,
-                    v,
-                    channel,
-                    brush,
-                    sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
             }
+            const auto& sample = plan_samples[sample_index];
+            if (!std::isfinite(sample.u) || !std::isfinite(sample.v))
+            {
+                continue;
+            }
+            std::array<double, 4> albedo_sample{};
+            std::array<double, 4> pbr_sample{};
+            sample_raw_texture(
+                albedo.bytes, texture_size, sample.u, sample.v, albedo_sample);
+            sample_raw_texture(
+                packed_pbr.bytes, texture_size, sample.u, sample.v, pbr_sample);
+            const auto channel = sdk_make_channel(
+                runtime_contract::appearance_srgb_to_linear(albedo_sample[0]),
+                runtime_contract::appearance_srgb_to_linear(albedo_sample[1]),
+                runtime_contract::appearance_srgb_to_linear(albedo_sample[2]),
+                pbr_sample[0],
+                pbr_sample[1],
+                pbr_sample[2],
+                sdk::EPaintChannelApplyMode::Override);
+            strokes.push_back(sdk_make_uv_stroke(
+                sample.u,
+                sample.v,
+                channel,
+                brush,
+                sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
         }
         metadata += ",\"replay_strokes_total\":" + std::to_string(strokes.size());
         metadata += ",\"replay_alpha_skipping\":false";

@@ -133,18 +133,21 @@ Reuse Paint is a production paint operation with Start, Stop, Preview, and Stop
 Preview controls. Start extracts the saved `.mcpaint` archive to a temporary
 directory and issues `replay_paint_texture` with the raw `albedo.rgba` and
 `pbr.rgba` paths. The bridge reads those files before it creates the async job,
-then samples them directly in UV space on a texel grid and submits channel-7
-strokes through `PaintAtUVWithBrush` and the normal async job. The current game
-texture remains only as a legacy/internal fallback when raw paths are absent.
+then replays them through the same runtime mesh surface sample/plan generation
+that Image Paint uses. The live mesh profile, RuntimePaintable triangle cache,
+and Image Paint sample density produce the mesh samples; each sample's UV
+indexes the raw texture directly (no `v` flip). The bridge then submits
+channel-7 strokes through `PaintAtUVWithBrush` and the normal async job. The
+current game texture remains only as a legacy/internal fallback when raw paths
+are absent.
 
-Replay does not skip texels by alpha, because the paint alpha is zero. It uses
-the Image brush size, derives the default step from it, and applies the Image
-color-compression tolerance only to texels whose albedo and PBR match the
-previous emitted stroke. Preview performs a local import and stores the
-pre-preview material snapshot; Stop Preview restores it. Start never imports
-locally and never shows the final texture immediately. Reuse requires the same
-body and UV layout as the export; it may take time proportional to the texture
-grid, so keep the existing paint progress and cancellation paths active.
+Replay uses the Image brush size as the mesh sample density, never skips
+samples by alpha, and never applies color compression. Preview performs a local
+import and stores the pre-preview material snapshot; Stop Preview restores it.
+Start never imports locally and never shows the final texture immediately.
+Reuse requires the same body and mesh/UV layout as the export; it may take time
+proportional to the number of mesh surface samples, so keep the existing paint
+progress and cancellation paths active.
 
 Auto Detect applies only to Paint regions. It obtains one global dominant
 material pattern from `GetDominantPaintMaterialPatterns`, including M/R/E, and

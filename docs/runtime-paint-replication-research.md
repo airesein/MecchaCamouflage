@@ -27,19 +27,20 @@ texture up front: only the gradually submitted strokes appear. When no raw
 paths are supplied, the bridge retains the current-game-texture fallback for
 backward compatibility and internal use.
 
-Replay samples the texture on a UV grid (direct `v`, no image-editor flip) and
-uses the image brush size for the stroke radius. The default grid step is
-`max(1, brush_size_texels / 2)` unless the request supplies `step_texels`. The
-image color-compression tolerance skips a texel only when its albedo and PBR are
-within tolerance of the previously emitted stroke. Replay never drops texels
-because of alpha; the exported paint alpha is zero. Strokes use
-`sRGB -> linear` albedo and channel 7 through `PaintAtUVWithBrush`.
+Replay uses the same runtime mesh surface sample/plan generation as Image Paint:
+the live mesh profile, the RuntimePaintable triangle cache, and the Image Paint
+sample density (the Image brush size) produce the mesh samples. It does not use
+the 4-face image or the canonical atlas. Each mesh sample's UV indexes the saved
+raw albedo/PBR texture directly (no `v` flip) with edge-clamped bilinear
+sampling. Replay never skips samples by alpha and never applies color
+compression. Strokes use `sRGB -> linear` albedo and channel 7 through
+`PaintAtUVWithBrush`.
 
 Preview locally imports the archive and preserves the pre-preview material
 snapshot through the existing Preview/Unpreview mechanism. Stop Preview restores
 that snapshot. The local import is never the production replication transport.
-Direct UV replay requires the same body and UV layout that produced the export,
-and its duration grows with the texel grid.
+Reuse Paint requires the same body and mesh/UV layout that produced the export,
+and its duration grows with the number of mesh surface samples.
 
 ## Queue telemetry and completion
 

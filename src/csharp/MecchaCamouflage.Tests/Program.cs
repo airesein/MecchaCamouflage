@@ -103,7 +103,7 @@ var tests = new List<(string Name, Action Run)>
     ("image preset round-trips an uncompressed container", ImagePresetRoundTripsUncompressedContainer),
     ("paint texture archive normalizes manifest texture names", PaintTextureArchiveNormalizesManifest),
     ("reuse paint start previews and stops through direct UV replay", ReusePaintRequestsDirectUvReplay),
-    ("native replay samples raw UV textures with brush and compression settings", NativeReplaySamplesUvTextureDirectly),
+    ("native replay samples saved raw textures through the Image Paint mesh surface plan", NativeReplaySamplesMeshSurfacePlan),
     ("v1 image preset expands global transforms to layers", V1ImagePresetExpandsGlobalTransformsToLayers),
     ("GUI image save persists the active preset state", GuiImageSavePersistsActivePresetState),
     ("legacy image config migrates to active image state", LegacyImageConfigMigratesToDiskLibrary),
@@ -5934,7 +5934,7 @@ static void ReusePaintRequestsDirectUvReplay()
         "the web UI must enable the four Reuse Paint actions and show progress and completion toasts");
 }
 
-static void NativeReplaySamplesUvTextureDirectly()
+static void NativeReplaySamplesMeshSurfacePlan()
 {
     var root = FindRepositoryRoot();
     var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
@@ -5963,30 +5963,43 @@ static void NativeReplaySamplesUvTextureDirectly()
     Assert(body.Contains("mesh_first_export_channel_bytes(ref, ctx.component, sdk::EPaintChannel::Albedo)", StringComparison.Ordinal) &&
            body.Contains("sdk::EPaintChannel::Metallic", StringComparison.Ordinal),
         "replay must retain the current-game-texture fallback");
+    Assert(body.Contains("runtime_triangle_cache", StringComparison.Ordinal) &&
+           body.Contains("mesh_first_resolve_runtime_triangle_cache", StringComparison.Ordinal) &&
+           body.Contains("mesh_first_generate_plan_samples_from_runtime_cache", StringComparison.Ordinal) &&
+           body.Contains("std::vector<MeshFirstPlanSample> plan_samples", StringComparison.Ordinal),
+        "replay must reuse the Image Paint runtime-triangle/plan sample generation");
+    Assert(body.Contains("sdk_collect_front_mesh_candidates", StringComparison.Ordinal) &&
+           body.Contains("select_mesh_first_profile_for_candidate", StringComparison.Ordinal) &&
+           body.Contains("mesh_first_profile_metadata(profile)", StringComparison.Ordinal),
+        "replay must resolve the live mesh profile/UV before sampling");
+    Assert(!body.Contains("CanonicalImageAtlas", StringComparison.Ordinal) &&
+           !body.Contains("image_paint_rgba_base64", StringComparison.Ordinal) &&
+           !body.Contains("image_reference_profile", StringComparison.Ordinal),
+        "replay must not use the 4-face image or canonical atlas");
     Assert(body.Contains("image_paint_brush_size_texels", StringComparison.Ordinal) &&
-           body.Contains("default_step_texels = std::max(1, brush_size_texels / 2)", StringComparison.Ordinal),
-        "replay must follow the Image brush size and derive the default grid step from it");
+           body.Contains("replay_sample_spacing_texels", StringComparison.Ordinal) &&
+           body.Contains("brush_size_texels,", StringComparison.Ordinal),
+        "replay must use the Image brush size as the mesh sample density");
     Assert(!body.Contains("within_previous_color", StringComparison.Ordinal) &&
-           !body.Contains("compression_threshold", StringComparison.Ordinal),
-        "replay must not skip texels based on the previous stroke color (that leaves blank regions)");
+           !body.Contains("compression_threshold", StringComparison.Ordinal) &&
+           !body.Contains("color_compression_enabled", StringComparison.Ordinal),
+        "replay must not skip mesh samples based on previous stroke color or compression");
     Assert(!body.Contains("albedo.bytes[offset + 3U]", StringComparison.Ordinal) &&
-           body.Contains("replay_alpha_skipping", StringComparison.Ordinal),
-        "replay must not drop texels based on the paint texture alpha");
-    Assert(body.Contains("albedo.bytes[offset]", StringComparison.Ordinal) &&
-           body.Contains("packed_pbr.bytes[offset]", StringComparison.Ordinal),
-        "replay must sample albedo and packed PBR at the same direct texture index");
-    Assert(body.Contains("runtime_contract::appearance_srgb_to_linear(r)", StringComparison.Ordinal),
+           body.Contains("alpha_skipping", StringComparison.Ordinal),
+        "replay must not drop mesh samples based on the paint texture alpha");
+    Assert(body.Contains("sample_raw_texture(", StringComparison.Ordinal) &&
+           body.Contains("albedo.bytes, texture_size, sample.u, sample.v", StringComparison.Ordinal) &&
+           body.Contains("packed_pbr.bytes, texture_size, sample.u, sample.v", StringComparison.Ordinal) &&
+           !body.Contains("texture_size_denominator", StringComparison.Ordinal) &&
+           !body.Contains("grid_width", StringComparison.Ordinal),
+        "replay must sample albedo and packed PBR at each mesh sample UV instead of a texture grid");
+    Assert(body.Contains("runtime_contract::appearance_srgb_to_linear(albedo_sample[0])", StringComparison.Ordinal),
         "replay must convert sRGB albedo to linear values");
     Assert(body.Contains("sdk_make_uv_stroke(", StringComparison.Ordinal) &&
            body.Contains("sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive", StringComparison.Ordinal),
         "replay must build channel-7 UV strokes");
     Assert(body.Contains("sdk::EPaintChannelApplyMode::Override", StringComparison.Ordinal),
         "replay strokes must use Override apply mode");
-    Assert(body.Contains("texture_size_denominator", StringComparison.Ordinal),
-        "replay must map texture texels directly to UV without the 4-face image path");
-    Assert(!body.Contains("image_paint_enabled", StringComparison.Ordinal) &&
-           !body.Contains("front_region_mode", StringComparison.Ordinal),
-        "direct UV replay must not reuse the 4-face Image Paint planner");
     Assert(bridge.Contains("sdk_call_paint_at_uv_with_brush", StringComparison.Ordinal) &&
            bridge.Contains("PaintAtUVWithBrush", StringComparison.Ordinal),
         "replay must keep the game's PaintAtUVWithBrush production route");
