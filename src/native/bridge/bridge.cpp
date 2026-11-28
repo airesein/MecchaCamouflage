@@ -58,6 +58,13 @@
 
 namespace
 {
+    // Forward declarations used by the recording capture helpers, which are
+    // intentionally placed next to the recorded-stroke state at the top of the
+    // file. The full guarded implementations live with the other safe readers.
+    template <typename T>
+    auto safe_read(std::uintptr_t address, T fallback) -> T;
+    auto safe_copy(void* dest, const void* src, std::size_t size) -> bool;
+
     // =============================================================================
     // Section: Runtime globals, diagnostics, and bridge-side state
     // Risk: high. These values are shared by the injected runtime, listener thread,
@@ -397,9 +404,13 @@ namespace
     // =============================================================================
     // Section: Original paint-stroke recording
     // Risk: high. The ProcessEvent detour runs on the game thread and appends the
-    // local paint component's raw PaintAtUVWithBrush parameters while the user
-    // records. No colour blending, sRGB conversion, resampling, or compression is
-    // performed here; Reuse Paint feeds these exact values back to the game.
+    // local paint component's raw paint parameters while the user records. The
+    // game's own first-person brush enters through
+    // RuntimePaintableComponent::PaintAtScreenPosition (confirmed from the
+    // character Blueprint import table), while the app's direct transport uses
+    // PaintAtUVWithBrush. Both are captured. No colour blending, sRGB conversion,
+    // resampling, or compression is performed here; Reuse Paint feeds these exact
+    // values back to the game.
     // =============================================================================
 
     constexpr std::size_t MaxRecordedPaintStrokes = paint_stroke_recording::MaxStrokes;
@@ -409,14 +420,39 @@ namespace
     std::atomic<bool> g_recorded_strokes_active{false};
     std::atomic<std::uintptr_t> g_recorded_strokes_component{0};
     std::atomic<std::uintptr_t> g_recorded_strokes_function{0};
+    std::atomic<std::uintptr_t> g_recorded_strokes_screen_position_function{0};
+    std::atomic<std::uintptr_t> g_recorded_strokes_world_position_function{0};
     std::atomic<int> g_recorded_strokes_count{0};
     std::atomic<std::uint64_t> g_recorded_strokes_dropped{0};
+    std::atomic<int> g_recorded_strokes_uv_with_brush_count{0};
+    std::atomic<int> g_recorded_strokes_screen_position_count{0};
+    std::atomic<int> g_recorded_strokes_world_position_count{0};
+    std::atomic<int> g_recorded_strokes_screen_position_empty{0};
+    std::atomic<int> g_recorded_strokes_ignored_receiver_count{0};
+    // Runtime layout for PaintAtScreenPosition/PaintAtWorldPosition, resolved
+    // once from UFunction reflection when recording starts. The game brush does
+    // not pass BrushSettings; it uses the component's CurrentBrushSettings.
+    std::atomic<int> g_recorded_strokes_screen_channel_data_offset{-1};
+    std::atomic<int> g_recorded_strokes_screen_channel_data_size{0};
+    std::atomic<int> g_recorded_strokes_screen_channel_offset{-1};
+    std::atomic<int> g_recorded_strokes_screen_return_offset{-1};
+    std::atomic<int> g_recorded_strokes_screen_return_size{0};
+    std::atomic<int> g_recorded_strokes_screen_brush_offset{-1};
+    std::atomic<int> g_recorded_strokes_screen_brush_size{0};
+    std::atomic<int> g_recorded_strokes_screen_params_size{0};
+    std::atomic<int> g_recorded_strokes_current_brush_offset{-1};
+    std::atomic<int> g_recorded_strokes_current_brush_size{0};
+    std::atomic<bool> g_recorded_strokes_accept_any_receiver{false};
+    std::mutex g_recorded_strokes_receivers_mutex;
+    std::vector<std::uintptr_t> g_recorded_strokes_local_components{};
     // Reuse Paint submits strokes through the verified original ProcessEvent
     // entry point. The suppression counter is an additional guard in case a
     // future call path goes through the patched vtable instead.
     std::atomic<int> g_recorded_strokes_suppress{0};
     std::atomic<bool> g_recorded_strokes_hook_owned{false};
     std::atomic<std::uintptr_t> g_recorded_strokes_hook_slot{0};
+    std::mutex g_recorded_strokes_hook_mutex;
+    std::vector<std::uintptr_t> g_recorded_strokes_hook_slots{};
     std::mutex g_recorded_strokes_source_mutex;
     std::string g_recorded_strokes_source{"none"};
 
@@ -424,6 +460,25 @@ namespace
     {
         std::lock_guard<std::mutex> lock(g_recorded_strokes_source_mutex);
         g_recorded_strokes_source = source.empty() ? "none" : source;
+    }
+
+    auto recorded_strokes_add_source(const char* source) -> void
+    {
+        if (!source || !*source)
+        {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(g_recorded_strokes_source_mutex);
+        if (g_recorded_strokes_source == "none" || g_recorded_strokes_source.empty())
+        {
+            g_recorded_strokes_source = source;
+            return;
+        }
+        const std::string needle = std::string("+") + source;
+        if (g_recorded_strokes_source.find(source) == std::string::npos)
+        {
+            g_recorded_strokes_source += needle;
+        }
     }
 
     auto recorded_strokes_source() -> std::string
@@ -441,36 +496,191 @@ namespace
         }
         g_recorded_strokes_count.store(0, std::memory_order_release);
         g_recorded_strokes_dropped.store(0, std::memory_order_release);
+        g_recorded_strokes_uv_with_brush_count.store(0, std::memory_order_release);
+        g_recorded_strokes_screen_position_count.store(0, std::memory_order_release);
+        g_recorded_strokes_world_position_count.store(0, std::memory_order_release);
+        g_recorded_strokes_screen_position_empty.store(0, std::memory_order_release);
+        g_recorded_strokes_ignored_receiver_count.store(0, std::memory_order_release);
     }
 
-    auto recorded_strokes_capture(
-        const sdk::RuntimePaintableComponent_PaintAtUVWithBrush& params) -> void
+    auto recorded_strokes_capture_stroke(const sdk::FPaintStroke& stroke,
+                                         const char* source) -> bool
     {
         if (!g_recorded_strokes_active.load(std::memory_order_acquire) ||
             g_recorded_strokes_suppress.load(std::memory_order_acquire) > 0)
         {
-            return;
+            return false;
         }
-        if (!std::isfinite(params.Uv.X) || !std::isfinite(params.Uv.Y))
+        if (!std::isfinite(stroke.Uv.X) || !std::isfinite(stroke.Uv.Y))
         {
-            return;
+            return false;
         }
-        sdk::FPaintStroke stroke{};
-        stroke.Uv = params.Uv;
-        stroke.ChannelData = params.ChannelData;
-        stroke.BrushSettings = params.BrushSettings;
-        stroke.TargetChannel = params.Channel;
         {
             std::lock_guard<std::mutex> lock(g_recorded_strokes_mutex);
             if (g_recorded_strokes.size() >= MaxRecordedPaintStrokes)
             {
                 g_recorded_strokes_dropped.fetch_add(1, std::memory_order_relaxed);
-                return;
+                return false;
             }
             g_recorded_strokes.push_back(stroke);
             g_recorded_strokes_count.store(
                 static_cast<int>(g_recorded_strokes.size()),
                 std::memory_order_release);
+        }
+        recorded_strokes_add_source(source);
+        return true;
+    }
+
+    auto recorded_strokes_capture(
+        const sdk::RuntimePaintableComponent_PaintAtUVWithBrush& params) -> void
+    {
+        sdk::FPaintStroke stroke{};
+        stroke.Uv = params.Uv;
+        stroke.ChannelData = params.ChannelData;
+        stroke.BrushSettings = params.BrushSettings;
+        stroke.TargetChannel = params.Channel;
+        if (recorded_strokes_capture_stroke(stroke, "paint_at_uv_with_brush"))
+        {
+            g_recorded_strokes_uv_with_brush_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    auto recorded_strokes_receiver_is_local(std::uintptr_t object) -> bool
+    {
+        if (!object)
+        {
+            return false;
+        }
+        if (object == g_recorded_strokes_component.load(std::memory_order_acquire))
+        {
+            return true;
+        }
+        if (g_recorded_strokes_accept_any_receiver.load(std::memory_order_acquire))
+        {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(g_recorded_strokes_receivers_mutex);
+        return std::find(g_recorded_strokes_local_components.begin(),
+                         g_recorded_strokes_local_components.end(),
+                         object) != g_recorded_strokes_local_components.end();
+    }
+
+    auto recorded_strokes_capture_paint_entry(std::uintptr_t object,
+                                              std::uintptr_t function,
+                                              std::uint8_t* params) -> void
+    {
+        if (!params ||
+            !g_recorded_strokes_active.load(std::memory_order_acquire) ||
+            g_recorded_strokes_suppress.load(std::memory_order_acquire) > 0)
+        {
+            return;
+        }
+        const bool screen_position =
+            function != 0 &&
+            function == g_recorded_strokes_screen_position_function.load(std::memory_order_acquire);
+        const bool world_position =
+            function != 0 &&
+            function == g_recorded_strokes_world_position_function.load(std::memory_order_acquire);
+        if (!screen_position && !world_position)
+        {
+            return;
+        }
+        if (!recorded_strokes_receiver_is_local(object))
+        {
+            g_recorded_strokes_ignored_receiver_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const int channel_data_offset =
+            g_recorded_strokes_screen_channel_data_offset.load(std::memory_order_acquire);
+        const int channel_data_size =
+            g_recorded_strokes_screen_channel_data_size.load(std::memory_order_acquire);
+        const int channel_offset =
+            g_recorded_strokes_screen_channel_offset.load(std::memory_order_acquire);
+        const int return_offset =
+            g_recorded_strokes_screen_return_offset.load(std::memory_order_acquire);
+        const int return_size =
+            g_recorded_strokes_screen_return_size.load(std::memory_order_acquire);
+        if (channel_data_offset < 0 ||
+            channel_data_size != static_cast<int>(sizeof(sdk::FPaintChannelData)) ||
+            channel_offset < 0 ||
+            return_offset < 0 ||
+            return_size < static_cast<int>(sizeof(sdk::FScreenSpacePaintResult)))
+        {
+            return;
+        }
+        auto result = sdk::FScreenSpacePaintResult{};
+        if (!safe_copy(&result,
+                       params + static_cast<std::uintptr_t>(return_offset),
+                       sizeof(result)) ||
+            !result.bSuccess ||
+            !std::isfinite(result.HitUV.X) ||
+            !std::isfinite(result.HitUV.Y))
+        {
+            g_recorded_strokes_screen_position_empty.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        sdk::FPaintStroke stroke{};
+        stroke.Uv = result.HitUV;
+        stroke.WorldPosition = result.HitWorldPosition;
+        stroke.bHasWorldPosition = true;
+        if (!safe_copy(&stroke.ChannelData,
+                       params + static_cast<std::uintptr_t>(channel_data_offset),
+                       sizeof(stroke.ChannelData)))
+        {
+            return;
+        }
+        const auto channel =
+            safe_read<std::uint8_t>(reinterpret_cast<std::uintptr_t>(params) +
+                                        static_cast<std::uintptr_t>(channel_offset),
+                                    0);
+        stroke.TargetChannel = static_cast<sdk::EPaintChannel>(
+            std::clamp(static_cast<int>(channel),
+                       0,
+                       static_cast<int>(sdk::EPaintChannel::Max) - 1));
+        const int brush_offset =
+            g_recorded_strokes_screen_brush_offset.load(std::memory_order_acquire);
+        const int brush_size =
+            g_recorded_strokes_screen_brush_size.load(std::memory_order_acquire);
+        bool have_brush = false;
+        if (brush_offset >= 0)
+        {
+            have_brush = safe_copy(&stroke.BrushSettings,
+                                   params + static_cast<std::uintptr_t>(brush_offset),
+                                   static_cast<std::size_t>(
+                                       std::min(brush_size,
+                                                static_cast<int>(sizeof(stroke.BrushSettings)))));
+        }
+        if (!have_brush)
+        {
+            const int current_brush_offset =
+                g_recorded_strokes_current_brush_offset.load(std::memory_order_acquire);
+            if (current_brush_offset >= 0)
+            {
+                have_brush = safe_copy(&stroke.BrushSettings,
+                                       reinterpret_cast<const void*>(
+                                           object + static_cast<std::uintptr_t>(current_brush_offset)),
+                                       sizeof(stroke.BrushSettings));
+            }
+        }
+        if (!have_brush)
+        {
+            // The game route stores the live brush on the component. If it could
+            // not be read, keep the stroke so the recorded UV/material data is
+            // not lost; replay falls back to the current local brush tip.
+            stroke.BrushSettings = sdk::FRuntimeBrushSettings{};
+        }
+        const char* source = screen_position ? "paint_at_screen_position"
+                                             : "paint_at_world_position";
+        if (recorded_strokes_capture_stroke(stroke, source))
+        {
+            if (screen_position)
+            {
+                g_recorded_strokes_screen_position_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_recorded_strokes_world_position_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -24961,6 +25171,17 @@ namespace
                ",\"stroke_count\":" +
                    std::to_string(g_recorded_strokes_count.load(std::memory_order_acquire)) +
                ",\"stroke_source\":\"" + json_escape(recorded_strokes_source()) + "\"" +
+               ",\"recording_source\":\"process_event_detour\"" +
+               ",\"captured_paint_at_uv_with_brush\":" +
+                   std::to_string(g_recorded_strokes_uv_with_brush_count.load(std::memory_order_acquire)) +
+               ",\"captured_paint_at_screen_position\":" +
+                   std::to_string(g_recorded_strokes_screen_position_count.load(std::memory_order_acquire)) +
+               ",\"captured_paint_at_world_position\":" +
+                   std::to_string(g_recorded_strokes_world_position_count.load(std::memory_order_acquire)) +
+               ",\"screen_position_empty_returns\":" +
+                   std::to_string(g_recorded_strokes_screen_position_empty.load(std::memory_order_acquire)) +
+               ",\"ignored_nonlocal_receivers\":" +
+                   std::to_string(g_recorded_strokes_ignored_receiver_count.load(std::memory_order_acquire)) +
                ",\"strokes_dropped\":" +
                    std::to_string(g_recorded_strokes_dropped.load(std::memory_order_acquire));
     }
@@ -25008,6 +25229,39 @@ namespace
         return write_text_file_w(path, json);
     }
 
+    auto recorded_strokes_release_hooks() -> void
+    {
+        std::vector<std::uintptr_t> slots{};
+        {
+            std::lock_guard<std::mutex> lock(g_recorded_strokes_hook_mutex);
+            slots.swap(g_recorded_strokes_hook_slots);
+        }
+        // Restore through the exact slots we patched so Stop still works after
+        // a respawn invalidates the object pointer.
+        for (const auto slot : slots)
+        {
+            if (slot)
+            {
+                uninstall_process_event_vtable_hook_slot(slot);
+            }
+        }
+        if (g_recorded_strokes_hook_owned.exchange(false, std::memory_order_acq_rel))
+        {
+            const auto slot = g_recorded_strokes_hook_slot.exchange(0, std::memory_order_acq_rel);
+            if (slot && std::find(slots.begin(), slots.end(), slot) == slots.end())
+            {
+                uninstall_process_event_vtable_hook_slot(slot);
+            }
+        }
+        else
+        {
+            g_recorded_strokes_hook_slot.store(0, std::memory_order_release);
+        }
+        g_recorded_strokes_accept_any_receiver.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(g_recorded_strokes_receivers_mutex);
+        g_recorded_strokes_local_components.clear();
+    }
+
     auto start_stroke_recording_on_game_thread(const std::string& request) -> std::string
     {
         const bool restart = json_bool_field(request, "restart", false);
@@ -25050,50 +25304,233 @@ namespace
             return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message,
                                  "\"route\":\"start_stroke_recording\"");
         }
-        if (!ctx.local_paint_at_uv_function)
+        const auto screen_position_function =
+            ref.find_function(ctx.component, "PaintAtScreenPosition");
+        const auto world_position_function =
+            ref.find_function(ctx.component, "PaintAtWorldPosition");
+        if (!ctx.local_paint_at_uv_function &&
+            !screen_position_function &&
+            !world_position_function)
         {
             return response_json(false,
-                                 "PaintAtUVWithBrush_unavailable",
+                                 "paint_function_unavailable",
                                  0,
                                  1,
-                                 "PaintAtUVWithBrush is unavailable; recording cannot start",
+                                 "no supported paint function (PaintAtUVWithBrush, PaintAtScreenPosition, PaintAtWorldPosition) is available; recording cannot start",
                                  "\"route\":\"start_stroke_recording\"");
         }
-        std::string hook_failure{};
-        bool installed_new_hook = false;
-        if (!install_process_event_vtable_hook_for_object(
-                ctx.component, hook_failure, &installed_new_hook))
+        // Resolve the game's own entry-point layout once. PaintAtScreenPosition
+        // receives Mesh, ScreenPosition, PlayerController, ChannelData, Channel,
+        // bUseCachedTriangles and returns FScreenSpacePaintResult; the brush
+        // settings live on the component instead of the call parameters.
+        const auto layout_function =
+            screen_position_function ? screen_position_function : world_position_function;
+        int channel_data_offset = -1;
+        int channel_data_size = 0;
+        int channel_offset = -1;
+        int return_offset = -1;
+        int return_size = 0;
+        int brush_offset = -1;
+        int brush_size = 0;
+        int params_size = 0;
+        if (layout_function)
         {
+            params_size = safe_read<int>(layout_function + OffPropertiesSize, 0);
+            if (const auto prop = find_property_any(ref, layout_function, {"ChannelData", "PaintChannelData"}))
+            {
+                channel_data_offset = prop_offset(prop);
+                channel_data_size = prop_element_size(prop);
+            }
+            if (const auto prop = find_property_any(ref, layout_function, {"Channel", "TargetChannel"}))
+            {
+                channel_offset = prop_offset(prop);
+            }
+            if (const auto prop = find_property_any(ref, layout_function, {"ReturnValue"}))
+            {
+                return_offset = prop_offset(prop);
+                return_size = prop_element_size(prop);
+            }
+            if (const auto prop = find_property_any(ref, layout_function, {"BrushSettings", "RuntimeBrushSettings"}))
+            {
+                brush_offset = prop_offset(prop);
+                brush_size = prop_element_size(prop);
+            }
+        }
+        int current_brush_offset = -1;
+        int current_brush_size = 0;
+        if (const auto component_class = ref.class_ptr(ctx.component))
+        {
+            if (const auto prop = find_property_any(ref,
+                                                    component_class,
+                                                    {"CurrentBrushSettings", "BrushSettings"}))
+            {
+                current_brush_offset = prop_offset(prop);
+                current_brush_size = prop_element_size(prop);
+            }
+        }
+        if (current_brush_offset < 0)
+        {
+            current_brush_offset =
+                static_cast<int>(sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings);
+            current_brush_size = static_cast<int>(sizeof(sdk::FRuntimeBrushSettings));
+        }
+        if (current_brush_size < static_cast<int>(sizeof(sdk::FRuntimeBrushSettings)))
+        {
+            current_brush_offset = -1;
+        }
+
+        // Install the ProcessEvent detour on every local RuntimePaintableComponent,
+        // not only the single slot resolved for the app's transport. The game's
+        // first-person brush object can be a different instance or subclass.
+        std::vector<std::uintptr_t> local_components{};
+        const auto add_component = [&](std::uintptr_t component) {
+            if (component &&
+                std::find(local_components.begin(), local_components.end(), component) ==
+                    local_components.end())
+            {
+                local_components.push_back(component);
+            }
+        };
+        add_component(ctx.component);
+        const auto runtime_paintable_class = ref.find_class("RuntimePaintableComponent");
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!live_uobject(object) || object == ctx.component)
+            {
+                return false;
+            }
+            bool is_paintable = false;
+            for (auto cls = ref.class_ptr(object); cls; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+            {
+                if ((runtime_paintable_class && cls == runtime_paintable_class) ||
+                    contains_text(lower_copy(ref.class_name(cls)), "runtimepaintable"))
+                {
+                    is_paintable = true;
+                    break;
+                }
+            }
+            if (!is_paintable)
+            {
+                return false;
+            }
+            if ((ctx.pawn && sdk_object_is_or_belongs_to(ref, object, ctx.pawn)) ||
+                (ctx.controller && sdk_object_is_or_belongs_to(ref, object, ctx.controller)))
+            {
+                add_component(object);
+            }
+            return false;
+        });
+        {
+            std::lock_guard<std::mutex> lock(g_recorded_strokes_receivers_mutex);
+            g_recorded_strokes_local_components = local_components;
+        }
+        g_recorded_strokes_accept_any_receiver.store(local_components.size() <= 1,
+                                                     std::memory_order_release);
+
+        if (g_recorded_strokes_active.load(std::memory_order_acquire))
+        {
+            recorded_strokes_release_hooks();
+        }
+        std::vector<std::uintptr_t> owned_slots{};
+        int hooked_components = 0;
+        std::string last_hook_failure{};
+        for (const auto component : local_components)
+        {
+            std::string hook_failure{};
+            bool installed_new_hook = false;
+            if (!install_process_event_vtable_hook_for_object(
+                    component, hook_failure, &installed_new_hook))
+            {
+                last_hook_failure = hook_failure.empty()
+                                        ? "the ProcessEvent detour could not be installed"
+                                        : hook_failure;
+                continue;
+            }
+            ++hooked_components;
+            const auto recording_vtable = safe_read<std::uintptr_t>(component);
+            const auto recording_slot =
+                recording_vtable
+                    ? recording_vtable +
+                          static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t)
+                    : 0;
+            if (installed_new_hook && recording_slot)
+            {
+                owned_slots.push_back(recording_slot);
+            }
+        }
+        if (hooked_components == 0)
+        {
+            recorded_strokes_release_hooks();
             return response_json(false,
                                  "stroke_recording_hook_failed",
                                  0,
                                  1,
-                                 hook_failure.empty()
+                                 last_hook_failure.empty()
                                      ? "the ProcessEvent detour could not be installed"
-                                     : hook_failure,
+                                     : last_hook_failure,
                                  "\"route\":\"start_stroke_recording\"");
         }
-        const auto recording_vtable = safe_read<std::uintptr_t>(ctx.component);
-        const auto recording_slot =
-            recording_vtable
-                ? recording_vtable +
-                      static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t)
-                : 0;
-        g_recorded_strokes_hook_slot.store(recording_slot, std::memory_order_release);
-        if (installed_new_hook)
+        {
+            std::lock_guard<std::mutex> lock(g_recorded_strokes_hook_mutex);
+            g_recorded_strokes_hook_slots = owned_slots;
+        }
+        if (!owned_slots.empty())
         {
             g_recorded_strokes_hook_owned.store(true, std::memory_order_release);
+            g_recorded_strokes_hook_slot.store(owned_slots.front(), std::memory_order_release);
+        }
+        else
+        {
+            g_recorded_strokes_hook_owned.store(false, std::memory_order_release);
+            g_recorded_strokes_hook_slot.store(0, std::memory_order_release);
         }
         recorded_strokes_clear();
         g_recorded_strokes_component.store(ctx.component, std::memory_order_release);
         g_recorded_strokes_function.store(ctx.local_paint_at_uv_function, std::memory_order_release);
+        g_recorded_strokes_screen_position_function.store(screen_position_function,
+                                                          std::memory_order_release);
+        g_recorded_strokes_world_position_function.store(world_position_function,
+                                                         std::memory_order_release);
+        g_recorded_strokes_screen_channel_data_offset.store(channel_data_offset,
+                                                            std::memory_order_release);
+        g_recorded_strokes_screen_channel_data_size.store(channel_data_size,
+                                                          std::memory_order_release);
+        g_recorded_strokes_screen_channel_offset.store(channel_offset,
+                                                       std::memory_order_release);
+        g_recorded_strokes_screen_return_offset.store(return_offset,
+                                                      std::memory_order_release);
+        g_recorded_strokes_screen_return_size.store(return_size,
+                                                    std::memory_order_release);
+        g_recorded_strokes_screen_brush_offset.store(brush_offset,
+                                                     std::memory_order_release);
+        g_recorded_strokes_screen_brush_size.store(brush_size,
+                                                   std::memory_order_release);
+        g_recorded_strokes_screen_params_size.store(params_size,
+                                                    std::memory_order_release);
+        g_recorded_strokes_current_brush_offset.store(current_brush_offset,
+                                                      std::memory_order_release);
+        g_recorded_strokes_current_brush_size.store(current_brush_size,
+                                                    std::memory_order_release);
         recorded_strokes_set_source(paint_stroke_recording::NativeSource);
         g_recorded_strokes_active.store(true, std::memory_order_release);
         std::string metadata = recorded_stroke_metadata("start_stroke_recording");
         metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
         metadata += ",\"paint_function\":\"" + hex_address(ctx.local_paint_at_uv_function) + "\"";
+        metadata += ",\"screen_position_function\":\"" + hex_address(screen_position_function) + "\"";
+        metadata += ",\"world_position_function\":\"" + hex_address(world_position_function) + "\"";
+        metadata += ",\"screen_position_params_size\":" + std::to_string(params_size);
+        metadata += ",\"screen_position_channel_data_offset\":" + std::to_string(channel_data_offset);
+        metadata += ",\"screen_position_return_offset\":" + std::to_string(return_offset);
+        metadata += ",\"current_brush_offset\":" + std::to_string(current_brush_offset);
+        metadata += ",\"local_component_count\":" + std::to_string(local_components.size());
+        metadata += ",\"hooked_component_count\":" + std::to_string(hooked_components);
         metadata += ",\"recording_source\":\"process_event_detour\"";
+        metadata += ",\"recording_route\":\"PaintAtUVWithBrush+PaintAtScreenPosition\"";
         metadata += ",\"recording_full_history_required\":true";
+        if (layout_function)
+        {
+            metadata += ",\"screen_position_param_schema\":\"" +
+                        json_escape(sdk_function_property_schema(ref, layout_function)) + "\"";
+        }
         return response_json(true,
                              "stroke_recording_started",
                              0,
@@ -25106,21 +25543,7 @@ namespace
     {
         const bool was_active =
             g_recorded_strokes_active.exchange(false, std::memory_order_acq_rel);
-        if (g_recorded_strokes_hook_owned.exchange(false, std::memory_order_acq_rel))
-        {
-            // Restore through the exact slot we patched so Stop still works
-            // after a respawn invalidates the object pointer.
-            const auto slot = g_recorded_strokes_hook_slot.exchange(0, std::memory_order_acq_rel);
-            if (!uninstall_process_event_vtable_hook_slot(slot))
-            {
-                uninstall_process_event_vtable_hook_for_object(
-                    g_recorded_strokes_component.load(std::memory_order_acquire));
-            }
-        }
-        else
-        {
-            g_recorded_strokes_hook_slot.store(0, std::memory_order_release);
-        }
+        recorded_strokes_release_hooks();
         std::string metadata = recorded_stroke_metadata("stop_stroke_recording");
         metadata += ",\"was_active\":" + std::string(json_bool(was_active));
         metadata += ",\"recording_full_history_retained\":true";
@@ -31005,6 +31428,25 @@ namespace
         if (original)
         {
             reinterpret_cast<ProcessEventFn>(original)(object, function, params);
+        }
+        // PaintAtScreenPosition writes its FScreenSpacePaintResult return value
+        // into the params block, so the game's own brush stroke is captured only
+        // after the original call has run. The app's PaintAtUVWithBrush path is
+        // captured before the call above.
+        if (function && params &&
+            g_recorded_strokes_active.load(std::memory_order_acquire) &&
+            g_recorded_strokes_suppress.load(std::memory_order_acquire) == 0)
+        {
+            __try
+            {
+                recorded_strokes_capture_paint_entry(
+                    reinterpret_cast<std::uintptr_t>(object),
+                    reinterpret_cast<std::uintptr_t>(function),
+                    reinterpret_cast<std::uint8_t*>(params));
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
         }
         // Observe only after the HUD's native/Blueprint event has run.  AHUD
         // assigns its Canvas for this draw phase; this hook does not call any
@@ -37624,6 +38066,17 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         g_recorded_strokes_suppress.store(0, std::memory_order_release);
         g_recorded_strokes_hook_owned.store(false, std::memory_order_release);
         g_recorded_strokes_hook_slot.store(0, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> hook_lock(g_recorded_strokes_hook_mutex);
+            g_recorded_strokes_hook_slots.clear();
+        }
+        {
+            std::lock_guard<std::mutex> receiver_lock(g_recorded_strokes_receivers_mutex);
+            g_recorded_strokes_local_components.clear();
+        }
+        g_recorded_strokes_accept_any_receiver.store(false, std::memory_order_release);
+        g_recorded_strokes_screen_position_function.store(0, std::memory_order_release);
+        g_recorded_strokes_world_position_function.store(0, std::memory_order_release);
         {
             std::lock_guard<std::mutex> config_lock(g_esp_native_config_mutex);
             g_esp_native_config_signature.clear();

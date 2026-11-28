@@ -6078,6 +6078,17 @@ static void NativeStrokeRecordingGuardsReplay()
     Assert(bridge.Contains("is_replay_recorded_strokes_request", StringComparison.Ordinal) &&
            bridge.Contains("start_mesh_first_paint_async_job(job->request, job)", StringComparison.Ordinal),
         "recorded-stroke replay must reuse the existing async paint dispatcher");
+    Assert(bridge.Contains("PaintAtScreenPosition", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_capture_paint_entry", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_screen_position_function", StringComparison.Ordinal) &&
+           bridge.Contains("captured_paint_at_screen_position", StringComparison.Ordinal),
+        "the game's own brush route (RuntimePaintableComponent::PaintAtScreenPosition) must be captured separately from the app's PaintAtUVWithBrush transport");
+    Assert(bridge.Contains("recorded_strokes_local_components", StringComparison.Ordinal) &&
+           bridge.Contains("recorded_strokes_accept_any_receiver", StringComparison.Ordinal) &&
+           bridge.Contains("screen_position_return_offset", StringComparison.Ordinal) &&
+           bridge.Contains("screen_position_empty_returns", StringComparison.Ordinal) &&
+           bridge.Contains("ignored_nonlocal_receivers", StringComparison.Ordinal),
+        "recording must cover all local paint components and expose zero-count diagnostics");
 }
 
 static void WebUiExposesPaintStrokeRecording()

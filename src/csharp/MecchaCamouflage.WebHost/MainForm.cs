@@ -1302,6 +1302,9 @@ public sealed class MainForm : Form
         active = status.Active,
         strokeCount = status.StrokeCount,
         strokeSource = status.Source,
+        recordingSource = status.RecordingSource,
+        capturedPaintAtUVWithBrush = status.CapturedPaintAtUVWithBrush,
+        capturedPaintAtScreenPosition = status.CapturedPaintAtScreenPosition,
         dropped = status.Dropped
     };
 

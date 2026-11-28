@@ -2419,7 +2419,7 @@ let reusePaintStopPreviewPending = false;
 let paintArchiveStatus = { path: "", loading: false, success: false, message: "", textureSize: 0, strokeCount: 0, hasRecordedStrokes: false };
 let paintArchiveStatusTimer = null;
 let paintArchiveStatusRequest = 0;
-let paintRecording = { active: false, strokeCount: 0, source: "", dropped: 0 };
+let paintRecording = { active: false, strokeCount: 0, source: "", dropped: 0, recordingSource: "", capturedPaintAtUVWithBrush: 0, capturedPaintAtScreenPosition: 0 };
 let paintRecordingPending = false;
 let paintRecordingPollTimer = null;
 let paintRecordingPollInFlight = false;
@@ -2499,7 +2499,10 @@ function applyPaintRecordingStatus(result) {
     active: Boolean(result.active),
     strokeCount: Number(result.strokeCount || 0),
     source: result.strokeSource || "",
-    dropped: Number(result.dropped || 0)
+    dropped: Number(result.dropped || 0),
+    recordingSource: result.recordingSource || "",
+    capturedPaintAtUVWithBrush: Number(result.capturedPaintAtUVWithBrush || 0),
+    capturedPaintAtScreenPosition: Number(result.capturedPaintAtScreenPosition || 0)
   };
   renderReusePaintControls();
   updatePaintRecordingPoll();
@@ -2581,6 +2584,9 @@ function renderReusePaintControls() {
   const recordStatus = byId("image-record-status");
   if (recordStatus) {
     recordStatus.textContent = paintRecordingStatusLabel();
+    const capture = [paintRecording.recordingSource, paintRecording.source].filter(Boolean).join(" | ");
+    const counts = `uv_with_brush=${paintRecording.capturedPaintAtUVWithBrush} screen_position=${paintRecording.capturedPaintAtScreenPosition}`;
+    recordStatus.title = capture ? `${capture} | ${counts}` : counts;
     recordStatus.classList.toggle("active", paintRecording.active);
   }
 }

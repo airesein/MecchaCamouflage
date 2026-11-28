@@ -82,7 +82,10 @@ public sealed record PaintStrokeRecordingStatus(
     bool Active,
     int StrokeCount,
     string Source,
-    long Dropped);
+    long Dropped,
+    string RecordingSource = "",
+    int CapturedPaintAtUVWithBrush = 0,
+    int CapturedPaintAtScreenPosition = 0);
 
 /// <summary>
 /// Portable representation of the game's recorded PaintAtUVWithBrush

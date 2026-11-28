@@ -318,9 +318,9 @@ public sealed class HostSession
             }
             var status = ParseStrokeRecordingStatus(reply.Raw);
             if (label == "start")
-                Log.Info($"Stroke recording started | count={status.StrokeCount} | source={status.Source}");
+                Log.Info($"Stroke recording started | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource}");
             else if (label == "stop")
-                Log.Info($"Stroke recording stopped | count={status.StrokeCount} | source={status.Source}");
+                Log.Info($"Stroke recording stopped | count={status.StrokeCount} | source={status.Source} | recording_source={status.RecordingSource} | uv_with_brush={status.CapturedPaintAtUVWithBrush} | screen_position={status.CapturedPaintAtScreenPosition}");
             else if (label == "clear")
                 Log.Info("Stroke recording cleared.");
             return status;
@@ -349,11 +349,23 @@ public sealed class HostSession
                          activeElement.GetBoolean();
             var count = Int(metadata, "stroke_count", 0);
             var source = Text(metadata, "stroke_source", "");
+            var recordingSource = Text(metadata, "recording_source", "");
+            var capturedUvWithBrush = Int(metadata, "captured_paint_at_uv_with_brush", 0);
+            var capturedScreenPosition = Int(metadata, "captured_paint_at_screen_position", 0);
             var dropped = metadata.TryGetProperty("strokes_dropped", out var droppedElement) &&
                           droppedElement.TryGetInt64(out var droppedValue)
                 ? droppedValue
                 : 0L;
-            return new PaintStrokeRecordingStatus(true, "", active, count, source, dropped);
+            return new PaintStrokeRecordingStatus(
+                true,
+                "",
+                active,
+                count,
+                source,
+                dropped,
+                recordingSource,
+                capturedUvWithBrush,
+                capturedScreenPosition);
         }
         catch (JsonException)
         {
