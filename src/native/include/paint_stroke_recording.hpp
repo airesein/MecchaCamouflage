@@ -12,10 +12,12 @@
 #include <string>
 #include <vector>
 
-// Self-contained serialization for recorded PaintAtUVWithBrush strokes.
+// Self-contained serialization for recorded paint strokes.
 //
 // The recorded stroke list is the exact value-parameter payload the game
-// receives: UV, channel data, brush settings, and the target channel.  The
+// receives, plus the converter geometry needed to replay compact strokes:
+// UV, channel data, brush settings, target channel, world/local anchors, and
+// the skeletal triangle anchor/barycentrics.  The
 // on-disk schema is intentionally plain JSON so that the C# host can validate
 // the archive without duplicating any colour/brush math.  Nothing here applies
 // sRGB conversion, texture resampling, or lossy compression.
@@ -33,10 +35,82 @@ namespace paint_stroke_recording
         std::string failure{};
         std::string source{};
         std::vector<sdk::FPaintStroke> strokes{};
+        // Parallel to `strokes`: 1 when the archive provided a usable UV, 0
+        // when the compact converter only produced a skeletal triangle anchor.
+        std::vector<std::uint8_t> has_uv{};
         int declared_count{-1};
         int count{-1};
         std::uint64_t dropped{0};
     };
+
+    // A compact/converter stroke can carry only a skeletal triangle anchor and
+    // barycentric weights. Replaying it through the UV route requires the UV
+    // the game would have reconstructed from the mesh, so keep the geometry
+    // helpers here where both the bridge and the native tests can use them.
+    struct TriangleUv
+    {
+        double u[3]{};
+        double v[3]{};
+    };
+
+    inline auto stroke_has_geometry_anchor(const sdk::FPaintStroke& stroke) -> bool
+    {
+        return stroke.bHasWorldPosition || stroke.bHasLocalPosition ||
+               stroke.bHasSkeletalTriangleAnchor;
+    }
+
+    inline auto stroke_has_uv(const sdk::FPaintStroke& stroke) -> bool
+    {
+        if (!std::isfinite(stroke.Uv.X) || !std::isfinite(stroke.Uv.Y))
+        {
+            return false;
+        }
+        // The game's compact->full converter leaves Uv at exactly (0,0) when it
+        // only expands the skeletal anchor. A genuine (0,0) stroke without an
+        // anchor is still a real UV.
+        return stroke.Uv.X != 0.0 || stroke.Uv.Y != 0.0 ||
+               !stroke_has_geometry_anchor(stroke);
+    }
+
+    inline auto interpolate_triangle_uv(const TriangleUv& triangle,
+                                        double barycentric_a,
+                                        double barycentric_b,
+                                        double barycentric_c,
+                                        double& u,
+                                        double& v) -> bool
+    {
+        if (!std::isfinite(barycentric_a) || !std::isfinite(barycentric_b) ||
+            !std::isfinite(barycentric_c))
+        {
+            return false;
+        }
+        double sum = barycentric_a + barycentric_b + barycentric_c;
+        if (!std::isfinite(sum) || sum <= 1.0e-6)
+        {
+            return false;
+        }
+        barycentric_a /= sum;
+        barycentric_b /= sum;
+        barycentric_c /= sum;
+        for (int corner = 0; corner < 3; ++corner)
+        {
+            if (!std::isfinite(triangle.u[corner]) ||
+                !std::isfinite(triangle.v[corner]))
+            {
+                return false;
+            }
+        }
+        u = barycentric_a * triangle.u[0] + barycentric_b * triangle.u[1] +
+            barycentric_c * triangle.u[2];
+        v = barycentric_a * triangle.v[0] + barycentric_b * triangle.v[1] +
+            barycentric_c * triangle.v[2];
+        return std::isfinite(u) && std::isfinite(v);
+    }
+
+    inline auto append_bool(std::string& out, bool value) -> void
+    {
+        out += value ? "true" : "false";
+    }
 
     inline auto append_number(std::string& out, double value) -> void
     {
@@ -174,6 +248,54 @@ namespace paint_stroke_recording
             append_float(out, stroke.ChannelData.EmissiveColor);
             out += ",\"apply_mode\":";
             out += std::to_string(static_cast<int>(stroke.ChannelData.ApplyMode));
+            out += ",\"has_uv\":";
+            append_bool(out, stroke_has_uv(stroke));
+            out += ",\"has_world_position\":";
+            append_bool(out, stroke.bHasWorldPosition);
+            out += ",\"world_x\":";
+            append_number(out, stroke.WorldPosition.X);
+            out += ",\"world_y\":";
+            append_number(out, stroke.WorldPosition.Y);
+            out += ",\"world_z\":";
+            append_number(out, stroke.WorldPosition.Z);
+            out += ",\"has_local_position\":";
+            append_bool(out, stroke.bHasLocalPosition);
+            out += ",\"local_x\":";
+            append_number(out, stroke.LocalPosition.X);
+            out += ",\"local_y\":";
+            append_number(out, stroke.LocalPosition.Y);
+            out += ",\"local_z\":";
+            append_number(out, stroke.LocalPosition.Z);
+            out += ",\"has_skeletal_triangle_anchor\":";
+            append_bool(out, stroke.bHasSkeletalTriangleAnchor);
+            out += ",\"triangle_index\":";
+            out += std::to_string(stroke.SkeletalTriangleIndex);
+            out += ",\"barycentric_x\":";
+            append_number(out, stroke.SkeletalTriangleBarycentric.X);
+            out += ",\"barycentric_y\":";
+            append_number(out, stroke.SkeletalTriangleBarycentric.Y);
+            out += ",\"barycentric_z\":";
+            append_number(out, stroke.SkeletalTriangleBarycentric.Z);
+            out += ",\"effective_world_radius\":";
+            append_float(out, stroke.EffectiveBrushWorldRadius);
+            out += ",\"effective_subdivision_level\":";
+            out += std::to_string(stroke.EffectiveSubdivisionLevel);
+            out += ",\"effective_subdivision_pixel_size\":";
+            append_float(out, stroke.EffectiveSubdivisionPixelSize);
+            out += ",\"effective_template_resolution\":";
+            out += std::to_string(stroke.EffectiveTemplateResolution);
+            out += ",\"effective_max_generated_brush_triangles\":";
+            out += std::to_string(stroke.EffectiveMaxGeneratedBrushTriangles);
+            out += ",\"effective_gutter_expand_pixels\":";
+            out += std::to_string(stroke.EffectiveGutterExpandPixels);
+            out += ",\"replication_source_a\":";
+            out += std::to_string(stroke.ReplicationSourceId.A);
+            out += ",\"replication_source_b\":";
+            out += std::to_string(stroke.ReplicationSourceId.B);
+            out += ",\"replication_source_c\":";
+            out += std::to_string(stroke.ReplicationSourceId.C);
+            out += ",\"replication_source_d\":";
+            out += std::to_string(stroke.ReplicationSourceId.D);
             out.push_back('}');
         }
         out += "]}";
@@ -258,6 +380,56 @@ namespace paint_stroke_recording
         {
             const auto value = number_field(text, key, static_cast<double>(fallback));
             return std::clamp(static_cast<int>(value), minimum, maximum);
+        }
+
+        inline auto has_key(const std::string& text, const std::string& key) -> bool
+        {
+            return text.find(std::string("\"") + key + "\":") != std::string::npos;
+        }
+
+        inline auto bool_field(const std::string& text,
+                               const std::string& key,
+                               bool fallback) -> bool
+        {
+            const std::string needle = std::string("\"") + key + "\":";
+            auto start = text.find(needle);
+            if (start == std::string::npos)
+            {
+                return fallback;
+            }
+            start += needle.size();
+            while (start < text.size())
+            {
+                const char ch = text[start];
+                if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
+                {
+                    ++start;
+                    continue;
+                }
+                break;
+            }
+            if (text.compare(start, 4, "true") == 0)
+            {
+                return true;
+            }
+            if (text.compare(start, 5, "false") == 0)
+            {
+                return false;
+            }
+            return number_field(text, key, fallback ? 1.0 : 0.0) != 0.0;
+        }
+
+        inline auto u32_field(const std::string& text,
+                              const std::string& key,
+                              std::uint32_t fallback) -> std::uint32_t
+        {
+            const auto value = number_field(text, key, static_cast<double>(fallback));
+            if (!std::isfinite(value) || value <= 0.0)
+            {
+                return 0;
+            }
+            return static_cast<std::uint32_t>(
+                std::clamp(value, 0.0, 4294967295.0));
         }
 
         inline auto append_utf8(std::string& target, std::uint32_t codepoint) -> void
@@ -530,10 +702,67 @@ namespace paint_stroke_recording
             stroke.ChannelData.ApplyMode = static_cast<sdk::EPaintChannelApplyMode>(
                 detail::int_field(object_text, "apply_mode", 0, 0,
                                   static_cast<int>(sdk::EPaintChannelApplyMode::Max) - 1));
-            stroke.bHasWorldPosition = false;
-            stroke.bHasLocalPosition = false;
-            stroke.bHasSkeletalTriangleAnchor = false;
+            stroke.bHasWorldPosition =
+                detail::bool_field(object_text, "has_world_position", false);
+            stroke.WorldPosition.X =
+                detail::number_field(object_text, "world_x", 0.0);
+            stroke.WorldPosition.Y =
+                detail::number_field(object_text, "world_y", 0.0);
+            stroke.WorldPosition.Z =
+                detail::number_field(object_text, "world_z", 0.0);
+            stroke.bHasLocalPosition =
+                detail::bool_field(object_text, "has_local_position", false);
+            stroke.LocalPosition.X =
+                detail::number_field(object_text, "local_x", 0.0);
+            stroke.LocalPosition.Y =
+                detail::number_field(object_text, "local_y", 0.0);
+            stroke.LocalPosition.Z =
+                detail::number_field(object_text, "local_z", 0.0);
+            stroke.bHasSkeletalTriangleAnchor =
+                detail::bool_field(object_text, "has_skeletal_triangle_anchor", false);
+            stroke.SkeletalTriangleIndex =
+                detail::int_field(object_text, "triangle_index", 0, -1, 10'000'000);
+            stroke.SkeletalTriangleBarycentric.X =
+                detail::number_field(object_text, "barycentric_x", 0.0);
+            stroke.SkeletalTriangleBarycentric.Y =
+                detail::number_field(object_text, "barycentric_y", 0.0);
+            stroke.SkeletalTriangleBarycentric.Z =
+                detail::number_field(object_text, "barycentric_z", 0.0);
+            stroke.EffectiveBrushWorldRadius =
+                static_cast<float>(detail::number_field(object_text,
+                                                        "effective_world_radius",
+                                                        stroke.BrushSettings.Radius));
+            stroke.EffectiveSubdivisionLevel =
+                detail::int_field(object_text, "effective_subdivision_level", 0, -1, 64);
+            stroke.EffectiveSubdivisionPixelSize =
+                static_cast<float>(detail::number_field(object_text,
+                                                        "effective_subdivision_pixel_size",
+                                                        1.0));
+            stroke.EffectiveTemplateResolution =
+                detail::int_field(object_text, "effective_template_resolution", 0, 0, 65536);
+            stroke.EffectiveMaxGeneratedBrushTriangles =
+                detail::int_field(object_text,
+                                  "effective_max_generated_brush_triangles",
+                                  0,
+                                  0,
+                                  1'000'000);
+            stroke.EffectiveGutterExpandPixels =
+                detail::int_field(object_text, "effective_gutter_expand_pixels", 0, 0, 4096);
+            stroke.ReplicationSourceId.A =
+                detail::u32_field(object_text, "replication_source_a", 0);
+            stroke.ReplicationSourceId.B =
+                detail::u32_field(object_text, "replication_source_b", 0);
+            stroke.ReplicationSourceId.C =
+                detail::u32_field(object_text, "replication_source_c", 0);
+            stroke.ReplicationSourceId.D =
+                detail::u32_field(object_text, "replication_source_d", 0);
+
+            const bool has_uv =
+                detail::has_key(object_text, "has_uv")
+                    ? detail::bool_field(object_text, "has_uv", true)
+                    : stroke_has_uv(stroke);
             result.strokes.push_back(stroke);
+            result.has_uv.push_back(has_uv ? 1 : 0);
         });
 
         result.count = static_cast<int>(result.strokes.size());

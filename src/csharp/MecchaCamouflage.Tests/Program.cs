@@ -5967,6 +5967,33 @@ static void ReusePaintUsesRecordedStrokes()
            header.Contains("albedo_r", StringComparison.Ordinal) &&
            header.Contains("brush_texture_path", StringComparison.Ordinal),
         "the native stroke schema must carry raw channel values and brush identity");
+    Assert(header.Contains("\"has_uv\"", StringComparison.Ordinal) &&
+           header.Contains("\"has_world_position\"", StringComparison.Ordinal) &&
+           header.Contains("\"world_x\"", StringComparison.Ordinal) &&
+           header.Contains("\"has_local_position\"", StringComparison.Ordinal) &&
+           header.Contains("\"local_x\"", StringComparison.Ordinal) &&
+           header.Contains("\"has_skeletal_triangle_anchor\"", StringComparison.Ordinal) &&
+           header.Contains("\"triangle_index\"", StringComparison.Ordinal) &&
+           header.Contains("\"barycentric_x\"", StringComparison.Ordinal) &&
+           header.Contains("\"effective_world_radius\"", StringComparison.Ordinal) &&
+           header.Contains("\"replication_source_a\"", StringComparison.Ordinal),
+        "the archive must preserve world/local anchors, compact barycentrics, and per-stroke effective brush fields");
+    Assert(native.Contains("recorded_strokes_resolve_uv", StringComparison.Ordinal) &&
+           native.Contains("recorded_stroke_profile_triangle_uv", StringComparison.Ordinal) &&
+           native.Contains("interpolate_triangle_uv", StringComparison.Ordinal) &&
+           native.Contains("recorded_strokes_replay_diagnostics", StringComparison.Ordinal) &&
+           native.Contains("replay_strokes_uv_reconstructed_from_anchor", StringComparison.Ordinal) &&
+           native.Contains("replay_strokes_skipped_invalid_geometry", StringComparison.Ordinal) &&
+           native.Contains("replay_unique_uv_quantized", StringComparison.Ordinal) &&
+           native.Contains("replay_coverage_fraction", StringComparison.Ordinal) &&
+           native.Contains("replay_coverage_region_counts", StringComparison.Ordinal) &&
+           native.Contains("replay_uv_all_same", StringComparison.Ordinal) &&
+           native.Contains("replay_coverage_low", StringComparison.Ordinal),
+        "replay must reconstruct missing UVs from the skeletal anchor and report coverage diagnostics instead of painting one corner");
+    Assert(host.Contains("LogReplayCoverageDiagnostics", StringComparison.Ordinal) &&
+           host.Contains("Reuse Paint coverage", StringComparison.Ordinal) &&
+           host.Contains("uvFromAnchor", StringComparison.Ordinal),
+        "the host must log the recorded-stroke coverage diagnostics for the user");
 }
 
 static void PaintStrokeArchiveKeepsTextureFallback()
@@ -6172,6 +6199,11 @@ static void NativePackedPaintBatchDecoding()
            transfer.Contains("PackedConverterRoute", StringComparison.Ordinal) &&
            recording.Contains("NativeSource", StringComparison.Ordinal),
         "the host status record must carry decoded packed counts and the converter route");
+    Assert(recording.Contains("stroke_has_uv", StringComparison.Ordinal) &&
+           recording.Contains("interpolate_triangle_uv", StringComparison.Ordinal) &&
+           recording.Contains("SkeletalTriangleBarycentric", StringComparison.Ordinal) &&
+           recording.Contains("ReplicationSourceId", StringComparison.Ordinal),
+        "the stroke archive must keep the converter's skeletal anchor geometry so replay can rebuild UV coverage");
 }
 
 static void WebUiExposesPaintStrokeRecording()

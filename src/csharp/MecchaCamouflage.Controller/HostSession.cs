@@ -1133,6 +1133,7 @@ public sealed class HostSession
             var response = await Runtime.SendPaintAsync(payload, cancellationToken);
             var message = FriendlyBridgeMessage(response.Message.Length > 0 ? response.Message : response.Stage);
             var (replyTextureSize, strokeCount) = ParseReplayMetadata(response.Raw);
+            LogReplayCoverageDiagnostics(response.Raw);
             if (response.Success)
             {
                 lock (paintStateGate)
@@ -1226,6 +1227,67 @@ public sealed class HostSession
         catch
         {
             return (0, 0);
+        }
+    }
+
+    private void LogReplayCoverageDiagnostics(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return;
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            if (!document.RootElement.TryGetProperty("metadata", out var metadata) ||
+                metadata.ValueKind != JsonValueKind.Object)
+            {
+                return;
+            }
+            var parsed = Int(metadata, "replay_strokes_parsed", 0);
+            if (parsed <= 0)
+                return;
+            var paintable = Int(metadata, "replay_strokes_paintable", parsed);
+            var withUv = Int(metadata, "replay_strokes_with_uv", 0);
+            var withoutUv = Int(metadata, "replay_strokes_without_uv", 0);
+            var reconstructed = Int(metadata, "replay_strokes_uv_reconstructed_from_anchor", 0);
+            var skipped = Int(metadata, "replay_strokes_skipped_invalid_geometry", 0);
+            var uniqueUv = Int(metadata, "replay_unique_uv_quantized", 0);
+            var cells = Int(metadata, "replay_coverage_cells", 0);
+            var grid = Int(metadata, "replay_coverage_grid_size", 0);
+            var fraction = Number(metadata, "replay_coverage_fraction", 0.0);
+            var allSame = metadata.TryGetProperty("replay_uv_all_same", out var allSameElement) &&
+                          allSameElement.ValueKind == JsonValueKind.True;
+            var coverageLow = metadata.TryGetProperty("replay_coverage_low", out var coverageLowElement) &&
+                              coverageLowElement.ValueKind == JsonValueKind.True;
+            Log.Info(
+                $"Reuse Paint coverage: strokes={parsed} paintable={paintable} " +
+                $"uv={withUv} uvMissing={withoutUv} uvFromAnchor={reconstructed} " +
+                $"skipped={skipped} uniqueUv={uniqueUv} " +
+                $"cells={cells}/{grid * grid} ({fraction:P1})");
+            if (withoutUv > 0 || skipped > 0)
+            {
+                Log.Warn(
+                    "Reuse Paint coverage warning: recorded geometry could not be " +
+                    "mapped to the live mesh; those strokes were omitted instead of " +
+                    "being painted at one corner.");
+            }
+            if (allSame)
+            {
+                Log.Warn(
+                    "Reuse Paint coverage warning: every paintable stroke resolved to " +
+                    "the same UV, so the replay would land in one spot.");
+            }
+            if (coverageLow)
+            {
+                Log.Warn(
+                    "Reuse Paint coverage warning: the archive covers only a small " +
+                    "part of the paint UV grid. Preview shows the whole exported " +
+                    "texture; recorded-stroke replay only repaints what was captured " +
+                    "while Record was active.");
+            }
+        }
+        catch
+        {
+            // Coverage diagnostics are best effort and must never fail a replay.
         }
     }
 

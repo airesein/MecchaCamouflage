@@ -78,11 +78,43 @@ Each entry stores the exact value parameters the game receives:
   rotation, and the brush-tip texture identity)
 - target `Channel`
 
+`strokes.json` also preserves the full converter geometry so replay never has to
+guess where a stroke belongs: `has_uv`, world/local position and their flags, the
+skeletal triangle anchor flag/index and barycentric weights, the effective
+world-radius/subdivision/template fields, and the replication source GUID. Older
+archives that only contain `u`/`v` still load unchanged (their UV is treated as
+present).
+
 The values are stored as raw floating-point stroke data. No sRGB conversion,
 texture resampling, palette quantization, or compression is applied on either
 the recording or replay path. The app's own normal paint calls are also
 recorded; the app's Reuse Paint replay calls are explicitly suppressed so a
 replay can never feed itself back into the recording.
+
+### Replay coverage and missing UVs
+
+The game's compact `CompactPaintStroke -> PaintStroke` converter can leave `Uv`
+at `(0,0)` when it only expands the skeletal triangle anchor. Replaying such a
+stroke through `PaintAtUVWithBrush` would paint every dab at one corner, which
+looks like large blank areas.
+
+Replay therefore resolves each stroke before dispatch:
+
+1. If the archive has a usable `Uv`, use it exactly.
+2. Otherwise, if the stroke has a skeletal triangle anchor, interpolate the UV
+   from the verified mesh profile's per-vertex UVs using the stored barycentric
+   weights.
+3. If neither is available, omit that stroke and report it instead of painting
+   it at `(0,0)`.
+
+Replay reports the per-stroke brush radius, channel histogram, apply-mode
+histogram, stroke order, anchor counts, UV range, out-of-range count, unique
+quantized UV count, a 32x32 UV coverage grid, and the counts reconstructed from
+anchors or skipped. The host writes them to the runtime log as
+`Reuse Paint coverage: ...`; a low unique-UV count, a low coverage fraction
+(`replay_coverage_low`), or a nonzero skipped count identifies why an archive
+replays with blanks even though Preview is complete. Per-stroke brush/radius,
+channel, apply mode, colour data, and order are always kept.
 
 ## Recording must be on while painting
 
@@ -226,6 +258,16 @@ reports `stroke_count`, `stroke_source`, and `strokes_written` in its metadata.
   per-stroke radius but not the original hardness/opacity/spacing/falloff/
   blend/rotation/tip values; the converter supplies the current brush values for
   those fields.
+- If the converter leaves `Uv` absent, replay reconstructs it from the skeletal
+  triangle anchor and the verified mesh profile. That requires the archive's
+  triangle/barycentric anchor to match the live body's mesh profile; a body
+  switch, a different mesh layout, or a missing profile reports
+  `replay_strokes_skipped_invalid_geometry` and leaves those strokes unpainted
+  instead of covering the mesh with one-corner dabs. Compact apply at the known
+  RVA is not called by Reuse Paint: its exact argument layout has not been
+  verified, and calling an unverified native apply could crash the game, so the
+  replay keeps the verified `PaintAtUVWithBrush` transport with reconstructed
+  UVs.
 - Recording is bound to the local body/controller resolved when Record was
   pressed. Respawning or switching to a different body can require starting a
   new recording.

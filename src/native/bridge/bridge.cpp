@@ -82,6 +82,12 @@ namespace
     // Build 2026-11-16 layout of RuntimePaintableComponent's packed-paint
     // receive path. Dynamic discovery through the multicast UFunction and its
     // thunk is preferred; these RVAs are the last-resort validation anchor.
+    //
+    // The compact apply at 0x6580470 is the receiver-side route, but its exact
+    // argument layout (component + decoded compact array/count + target state)
+    // has not been verified from live code. Calling it with a guessed ABI could
+    // crash the game, so Reuse Paint keeps the verified PaintAtUVWithBrush
+    // transport and rebuilds a missing Uv from the converter's skeletal anchor.
     constexpr std::uintptr_t PackedPaintDecoderRvaFallback = 0x6581790;
     constexpr std::uintptr_t PackedPaintApplyRvaFallback = 0x6580470;
     constexpr std::uintptr_t PackedPaintConverterRvaFallback = 0x6580180;
@@ -27994,6 +28000,360 @@ namespace
         return found;
     }
 
+    struct RecordedStrokeUvResolution
+    {
+        std::vector<sdk::FPaintStroke> strokes{};
+        int missing_uv_before{0};
+        int reconstructed{0};
+        int skipped{0};
+        bool profile_loaded{false};
+        std::string profile_stage{"not_needed"};
+        std::string profile_failure{};
+    };
+
+    auto recorded_stroke_profile_triangle_uv(const MeshFirstProfile& profile,
+                                              const sdk::FPaintStroke& stroke,
+                                              sdk::FVector2D& uv) -> bool
+    {
+        if (!stroke.bHasSkeletalTriangleAnchor || stroke.SkeletalTriangleIndex < 0)
+        {
+            return false;
+        }
+        const auto triangle_base =
+            static_cast<std::size_t>(stroke.SkeletalTriangleIndex) * 3;
+        if (triangle_base + 2 >= profile.indices.size() ||
+            profile.vertices.empty())
+        {
+            return false;
+        }
+        paint_stroke_recording::TriangleUv triangle{};
+        for (int corner = 0; corner < 3; ++corner)
+        {
+            const int vertex_index =
+                profile.indices[triangle_base + static_cast<std::size_t>(corner)];
+            if (vertex_index < 0 ||
+                static_cast<std::size_t>(vertex_index) >= profile.vertices.size())
+            {
+                return false;
+            }
+            const auto& vertex =
+                profile.vertices[static_cast<std::size_t>(vertex_index)];
+            triangle.u[corner] = vertex.u;
+            triangle.v[corner] = vertex.v;
+        }
+        double reconstructed_u = 0.0;
+        double reconstructed_v = 0.0;
+        if (!paint_stroke_recording::interpolate_triangle_uv(
+                triangle,
+                stroke.SkeletalTriangleBarycentric.X,
+                stroke.SkeletalTriangleBarycentric.Y,
+                stroke.SkeletalTriangleBarycentric.Z,
+                reconstructed_u,
+                reconstructed_v))
+        {
+            return false;
+        }
+        uv = {reconstructed_u, reconstructed_v};
+        return true;
+    }
+
+    auto recorded_strokes_resolve_uv(
+        Reflection& ref,
+        const SdkContext& ctx,
+        std::vector<sdk::FPaintStroke> strokes,
+        const std::vector<std::uint8_t>& has_uv,
+        RecordedStrokeUvResolution& out) -> void
+    {
+        out = {};
+        for (std::size_t index = 0; index < strokes.size(); ++index)
+        {
+            if (index >= has_uv.size() || has_uv[index] == 0)
+            {
+                ++out.missing_uv_before;
+            }
+        }
+
+        MeshFirstProfile profile{};
+        if (out.missing_uv_before > 0)
+        {
+            // A compact->full converter can leave Uv at (0,0) and carry only
+            // the skeletal triangle anchor. Reconstruct the exact UV the game
+            // would use from the verified mesh profile's per-vertex UVs.
+            try
+            {
+                const auto mesh_candidates =
+                    sdk_collect_front_mesh_candidates(ref, ctx);
+                SdkFrontMeshCandidate selected_mesh{};
+                if (!mesh_candidates.empty() &&
+                    sdk_select_profile_mesh_candidate(ref,
+                                                      mesh_candidates,
+                                                      selected_mesh))
+                {
+                    const auto profile_catalog = load_mesh_first_profile_catalog();
+                    std::string profile_failure{};
+                    out.profile_loaded = select_mesh_first_profile_for_candidate(
+                        ref,
+                        profile_catalog,
+                        selected_mesh,
+                        profile,
+                        profile_failure);
+                    out.profile_failure = profile_failure;
+                    out.profile_stage =
+                        out.profile_loaded
+                            ? "mesh_profile_loaded"
+                            : (profile_catalog.empty()
+                                   ? "mesh_profile_missing"
+                                   : "mesh_profile_identity_mismatch");
+                }
+                else
+                {
+                    out.profile_stage = "mesh_profile_candidate_unavailable";
+                }
+            }
+            catch (...)
+            {
+                out.profile_stage = "mesh_profile_resolution_exception";
+            }
+        }
+
+        out.strokes.reserve(strokes.size());
+        for (std::size_t index = 0; index < strokes.size(); ++index)
+        {
+            auto stroke = strokes[index];
+            const bool archive_has_uv =
+                index < has_uv.size()
+                    ? has_uv[index] != 0
+                    : paint_stroke_recording::stroke_has_uv(stroke);
+            const bool uv_usable =
+                archive_has_uv && std::isfinite(stroke.Uv.X) &&
+                std::isfinite(stroke.Uv.Y);
+            if (uv_usable)
+            {
+                out.strokes.push_back(std::move(stroke));
+                continue;
+            }
+            sdk::FVector2D reconstructed{};
+            if (out.profile_loaded &&
+                recorded_stroke_profile_triangle_uv(profile,
+                                                    stroke,
+                                                    reconstructed))
+            {
+                stroke.Uv = reconstructed;
+                out.strokes.push_back(std::move(stroke));
+                ++out.reconstructed;
+                continue;
+            }
+            // Sending a stroke whose UV is still unknown would paint every
+            // such dab at one corner. Leave it out and report the count.
+            ++out.skipped;
+        }
+    }
+
+    auto recorded_strokes_replay_diagnostics(
+        const std::vector<sdk::FPaintStroke>& strokes,
+        int parsed_total,
+        const RecordedStrokeUvResolution& resolution) -> std::string
+    {
+        constexpr int CoverageGrid = 32;
+        int with_uv = 0;
+        int without_uv = 0;
+        int world_anchors = 0;
+        int local_anchors = 0;
+        int triangle_anchors = 0;
+        int out_of_range = 0;
+        double min_u = 0.0;
+        double max_u = 0.0;
+        double min_v = 0.0;
+        double max_v = 0.0;
+        bool ranges_initialized = false;
+        float radius_min = 0.0f;
+        float radius_max = 0.0f;
+        bool radius_initialized = false;
+        int channel_counts[8]{};
+        int apply_mode_counts[4]{};
+        std::vector<std::uint8_t> cells(
+            static_cast<std::size_t>(CoverageGrid) * CoverageGrid, 0);
+        int region_counts[16]{};
+        std::unordered_set<std::uint64_t> unique_uv{};
+        unique_uv.reserve(strokes.size());
+
+        for (const auto& stroke : strokes)
+        {
+            if (stroke.bHasWorldPosition)
+            {
+                ++world_anchors;
+            }
+            if (stroke.bHasLocalPosition)
+            {
+                ++local_anchors;
+            }
+            if (stroke.bHasSkeletalTriangleAnchor)
+            {
+                ++triangle_anchors;
+            }
+            const float radius = stroke.BrushSettings.Radius;
+            if (std::isfinite(radius) && radius > 0.0f)
+            {
+                if (!radius_initialized)
+                {
+                    radius_min = radius;
+                    radius_max = radius;
+                    radius_initialized = true;
+                }
+                else
+                {
+                    radius_min = std::min(radius_min, radius);
+                    radius_max = std::max(radius_max, radius);
+                }
+            }
+            const int channel = std::clamp(
+                static_cast<int>(stroke.TargetChannel), 0, 7);
+            ++channel_counts[channel];
+            const int apply_mode = std::clamp(
+                static_cast<int>(stroke.ChannelData.ApplyMode), 0, 3);
+            ++apply_mode_counts[apply_mode];
+
+            if (!paint_stroke_recording::stroke_has_uv(stroke))
+            {
+                ++without_uv;
+                continue;
+            }
+            ++with_uv;
+            const double u = stroke.Uv.X;
+            const double v = stroke.Uv.Y;
+            if (!ranges_initialized)
+            {
+                min_u = max_u = u;
+                min_v = max_v = v;
+                ranges_initialized = true;
+            }
+            else
+            {
+                min_u = std::min(min_u, u);
+                max_u = std::max(max_u, u);
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+            if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0)
+            {
+                ++out_of_range;
+                continue;
+            }
+            const int cell_u = std::clamp(
+                static_cast<int>(std::floor(u * CoverageGrid)), 0, CoverageGrid - 1);
+            const int cell_v = std::clamp(
+                static_cast<int>(std::floor(v * CoverageGrid)), 0, CoverageGrid - 1);
+            cells[static_cast<std::size_t>(cell_v) * CoverageGrid + cell_u] = 1;
+            const int region_u =
+                std::clamp(static_cast<int>(std::floor(u * 4.0)), 0, 3);
+            const int region_v =
+                std::clamp(static_cast<int>(std::floor(v * 4.0)), 0, 3);
+            ++region_counts[region_v * 4 + region_u];
+            const auto quantized =
+                (static_cast<std::uint64_t>(std::lround(
+                     std::clamp(u, 0.0, 1.0) * 10000.0)) *
+                 10001ULL) +
+                static_cast<std::uint64_t>(std::lround(
+                    std::clamp(v, 0.0, 1.0) * 10000.0));
+            unique_uv.insert(quantized);
+        }
+        int covered_cells = 0;
+        for (const auto cell : cells)
+        {
+            covered_cells += cell ? 1 : 0;
+        }
+        const int total_cells = CoverageGrid * CoverageGrid;
+        const double coverage_fraction =
+            total_cells > 0
+                ? static_cast<double>(covered_cells) /
+                      static_cast<double>(total_cells)
+                : 0.0;
+
+        std::string channel_list{"["};
+        for (int index = 0; index < 8; ++index)
+        {
+            if (index > 0)
+            {
+                channel_list += ",";
+            }
+            channel_list += std::to_string(channel_counts[index]);
+        }
+        channel_list += "]";
+        std::string apply_mode_list{"["};
+        for (int index = 0; index < 4; ++index)
+        {
+            if (index > 0)
+            {
+                apply_mode_list += ",";
+            }
+            apply_mode_list += std::to_string(apply_mode_counts[index]);
+        }
+        apply_mode_list += "]";
+        std::string region_list{"["};
+        for (int index = 0; index < 16; ++index)
+        {
+            if (index > 0)
+            {
+                region_list += ",";
+            }
+            region_list += std::to_string(region_counts[index]);
+        }
+        region_list += "]";
+
+        std::string metadata{};
+        metadata += ",\"replay_strokes_parsed\":" + std::to_string(parsed_total);
+        metadata += ",\"replay_strokes_paintable\":" +
+                    std::to_string(strokes.size());
+        metadata += ",\"replay_strokes_with_uv\":" + std::to_string(with_uv);
+        metadata += ",\"replay_strokes_without_uv\":" + std::to_string(without_uv);
+        metadata += ",\"replay_strokes_uv_missing_in_archive\":" +
+                    std::to_string(resolution.missing_uv_before);
+        metadata += ",\"replay_strokes_uv_reconstructed_from_anchor\":" +
+                    std::to_string(resolution.reconstructed);
+        metadata += ",\"replay_strokes_skipped_invalid_geometry\":" +
+                    std::to_string(resolution.skipped);
+        metadata += ",\"replay_world_anchor_strokes\":" +
+                    std::to_string(world_anchors);
+        metadata += ",\"replay_local_anchor_strokes\":" +
+                    std::to_string(local_anchors);
+        metadata += ",\"replay_triangle_anchor_strokes\":" +
+                    std::to_string(triangle_anchors);
+        metadata += ",\"replay_uv_reconstruction_profile_loaded\":" +
+                    std::string(json_bool(resolution.profile_loaded));
+        metadata += ",\"replay_uv_reconstruction_profile_stage\":\"" +
+                    json_escape(resolution.profile_stage) + "\"";
+        metadata += ",\"replay_uv_reconstruction_failure\":\"" +
+                    json_escape(resolution.profile_failure) + "\"";
+        metadata += ",\"replay_uv_min_u\":" + std::to_string(min_u);
+        metadata += ",\"replay_uv_max_u\":" + std::to_string(max_u);
+        metadata += ",\"replay_uv_min_v\":" + std::to_string(min_v);
+        metadata += ",\"replay_uv_max_v\":" + std::to_string(max_v);
+        metadata += ",\"replay_uv_out_of_range_strokes\":" +
+                    std::to_string(out_of_range);
+        metadata += ",\"replay_unique_uv_quantized\":" +
+                    std::to_string(unique_uv.size());
+        metadata += ",\"replay_uv_all_same\":" +
+                    std::string(json_bool(with_uv > 1 && unique_uv.size() <= 1));
+        metadata += ",\"replay_radius_min\":" + std::to_string(radius_min);
+        metadata += ",\"replay_radius_max\":" + std::to_string(radius_max);
+        metadata += ",\"replay_coverage_grid_size\":" + std::to_string(CoverageGrid);
+        metadata += ",\"replay_coverage_cells\":" +
+                    std::to_string(covered_cells);
+        metadata += ",\"replay_coverage_fraction\":" +
+                    std::to_string(coverage_fraction);
+        metadata += ",\"replay_coverage_low\":" +
+                    std::string(json_bool(with_uv > 0 &&
+                                          coverage_fraction < 0.10));
+        metadata += ",\"replay_coverage_region_counts\":" + region_list;
+        metadata += ",\"replay_target_channel_counts\":" + channel_list;
+        metadata += ",\"replay_apply_mode_counts\":" + apply_mode_list;
+        metadata += ",\"replay_preserves_per_stroke_brush\":true";
+        metadata += ",\"replay_preserves_per_stroke_channel\":true";
+        metadata += ",\"replay_preserves_per_stroke_apply_mode\":true";
+        metadata += ",\"replay_preserves_stroke_order\":true";
+        return metadata;
+    }
+
     auto replay_recorded_strokes_on_game_thread(
         const std::string& request,
         const std::shared_ptr<QueuedPaintJob>& queued_job) -> std::string
@@ -28130,7 +28490,8 @@ namespace
         metadata += ",\"recorded_strokes_source\":\"" + json_escape(parsed.source) + "\"";
         metadata += ",\"recorded_strokes_declared\":" + std::to_string(parsed.declared_count);
         metadata += ",\"recorded_strokes_dropped\":" + std::to_string(parsed.dropped);
-        metadata += ",\"replay_strokes_total\":" + std::to_string(parsed.strokes.size());
+        const int parsed_stroke_count = static_cast<int>(parsed.strokes.size());
+        metadata += ",\"replay_strokes_total\":" + std::to_string(parsed_stroke_count);
         metadata += ",\"replay_strategy_requested\":\"recorded\"";
         metadata += ",\"replay_strategy_used\":\"recorded_strokes\"";
         metadata += ",\"replay_base_strokes\":0";
@@ -28138,6 +28499,25 @@ namespace
         metadata += ",\"local_route_mode\":\"native_recorded_paint\"";
         metadata += ",\"authoritative_replay\":\"direct_game_recorded_strokes\"";
         metadata += ",\"local_texture_import_required\":false";
+
+        RecordedStrokeUvResolution uv_resolution{};
+        recorded_strokes_resolve_uv(ref,
+                                    ctx,
+                                    std::move(parsed.strokes),
+                                    parsed.has_uv,
+                                    uv_resolution);
+        metadata += recorded_strokes_replay_diagnostics(
+            uv_resolution.strokes, parsed_stroke_count, uv_resolution);
+        if (uv_resolution.strokes.empty())
+        {
+            return response_json(
+                false,
+                "recorded_strokes_no_paintable_geometry",
+                0,
+                1,
+                "the recorded strokes carry neither a usable UV nor a skeletal triangle anchor that matches the live mesh",
+                metadata + ",\"replay_blocked\":true");
+        }
 
         auto async_job = std::make_shared<MeshFirstServerBatchAsyncJob>();
         async_job->queued = queued_job;
@@ -28230,7 +28610,7 @@ namespace
             async_job->replication_pacing.cadence_ms;
         async_job->local_dispatch_peak_delay_ms =
             async_job->replication_pacing.cadence_ms;
-        async_job->strokes = std::move(parsed.strokes);
+        async_job->strokes = std::move(uv_resolution.strokes);
         async_job->initial_stroke_count =
             static_cast<int>(async_job->strokes.size());
         async_job->metadata =

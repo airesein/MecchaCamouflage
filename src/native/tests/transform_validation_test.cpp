@@ -115,12 +115,37 @@ int main()
         first.ChannelData.Height = 0.1f;
         first.ChannelData.EmissiveColor = 0.2f;
         first.ChannelData.ApplyMode = sdk::EPaintChannelApplyMode::AlphaBlend;
+        first.bHasWorldPosition = true;
+        first.WorldPosition = {12.5, 34.25, -56.75};
+        first.bHasLocalPosition = true;
+        first.LocalPosition = {1.5, 2.25, 3.75};
+        first.bHasSkeletalTriangleAnchor = true;
+        first.SkeletalTriangleIndex = 42;
+        first.SkeletalTriangleBarycentric = {0.25, 0.5, 0.25};
+        first.EffectiveBrushWorldRadius = 0.0375f;
+        first.EffectiveSubdivisionLevel = 3;
+        first.EffectiveSubdivisionPixelSize = 0.5f;
+        first.EffectiveTemplateResolution = 512;
+        first.EffectiveMaxGeneratedBrushTriangles = 4096;
+        first.EffectiveGutterExpandPixels = 2;
+        first.ReplicationSourceId = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
         strokes[0] = first;
+        // The compact converter can leave Uv at (0,0) and carry only the
+        // skeletal triangle anchor. The archive must remember that Uv is absent
+        // so replay can reconstruct it instead of painting at one corner.
         sdk::FPaintStroke second{};
-        second.Uv = {0.5, 0.5};
+        second.Uv = {0.0, 0.0};
         second.TargetChannel = sdk::EPaintChannel::Albedo;
         second.BrushSettings.Radius = 0.02f;
         second.ChannelData.AlbedoColor = {1.0f, 0.0f, 0.0f, 1.0f};
+        second.bHasWorldPosition = true;
+        second.WorldPosition = {-1.0, -2.0, -3.0};
+        second.bHasLocalPosition = true;
+        second.LocalPosition = {4.0, 5.0, 6.0};
+        second.bHasSkeletalTriangleAnchor = true;
+        second.SkeletalTriangleIndex = 7;
+        second.SkeletalTriangleBarycentric = {0.2, 0.3, 0.5};
+        second.EffectiveBrushWorldRadius = 0.025f;
         strokes[1] = second;
 
         const auto json = paint_stroke_recording::serialize(
@@ -162,6 +187,66 @@ int main()
         {
             return 195;
         }
+        if (parsed.has_uv.size() != 2 || parsed.has_uv[0] != 1 ||
+            parsed.has_uv[1] != 0 || !paint_stroke_recording::stroke_has_uv(first) ||
+            paint_stroke_recording::stroke_has_uv(second))
+        {
+            return 198;
+        }
+        if (!round_trip.bHasWorldPosition ||
+            std::abs(round_trip.WorldPosition.X - first.WorldPosition.X) > 1e-12 ||
+            std::abs(round_trip.WorldPosition.Y - first.WorldPosition.Y) > 1e-12 ||
+            std::abs(round_trip.WorldPosition.Z - first.WorldPosition.Z) > 1e-12 ||
+            !round_trip.bHasLocalPosition ||
+            std::abs(round_trip.LocalPosition.X - first.LocalPosition.X) > 1e-12 ||
+            std::abs(round_trip.LocalPosition.Y - first.LocalPosition.Y) > 1e-12 ||
+            std::abs(round_trip.LocalPosition.Z - first.LocalPosition.Z) > 1e-12 ||
+            !round_trip.bHasSkeletalTriangleAnchor ||
+            round_trip.SkeletalTriangleIndex != first.SkeletalTriangleIndex ||
+            std::abs(round_trip.SkeletalTriangleBarycentric.X -
+                     first.SkeletalTriangleBarycentric.X) > 1e-12 ||
+            std::abs(round_trip.SkeletalTriangleBarycentric.Y -
+                     first.SkeletalTriangleBarycentric.Y) > 1e-12 ||
+            std::abs(round_trip.SkeletalTriangleBarycentric.Z -
+                     first.SkeletalTriangleBarycentric.Z) > 1e-12 ||
+            std::abs(round_trip.EffectiveBrushWorldRadius -
+                     first.EffectiveBrushWorldRadius) > 1e-7f ||
+            round_trip.EffectiveSubdivisionLevel != first.EffectiveSubdivisionLevel ||
+            std::abs(round_trip.EffectiveSubdivisionPixelSize -
+                     first.EffectiveSubdivisionPixelSize) > 1e-7f ||
+            round_trip.EffectiveTemplateResolution != first.EffectiveTemplateResolution ||
+            round_trip.EffectiveMaxGeneratedBrushTriangles !=
+                first.EffectiveMaxGeneratedBrushTriangles ||
+            round_trip.EffectiveGutterExpandPixels != first.EffectiveGutterExpandPixels ||
+            round_trip.ReplicationSourceId.A != first.ReplicationSourceId.A ||
+            round_trip.ReplicationSourceId.B != first.ReplicationSourceId.B ||
+            round_trip.ReplicationSourceId.C != first.ReplicationSourceId.C ||
+            round_trip.ReplicationSourceId.D != first.ReplicationSourceId.D)
+        {
+            return 199;
+        }
+        const auto& anchor_only = parsed.strokes[1];
+        if (anchor_only.Uv.X != 0.0 || anchor_only.Uv.Y != 0.0 ||
+            !anchor_only.bHasSkeletalTriangleAnchor ||
+            anchor_only.SkeletalTriangleIndex != 7 ||
+            std::abs(anchor_only.SkeletalTriangleBarycentric.Z - 0.5) > 1e-12 ||
+            !anchor_only.bHasWorldPosition || !anchor_only.bHasLocalPosition ||
+            std::abs(anchor_only.EffectiveBrushWorldRadius - 0.025f) > 1e-7f)
+        {
+            return 200;
+        }
+        const paint_stroke_recording::TriangleUv triangle_uv{
+            {0.0, 0.5, 1.0},
+            {0.25, 0.75, 0.0}};
+        double reconstructed_u = 0.0;
+        double reconstructed_v = 0.0;
+        if (!paint_stroke_recording::interpolate_triangle_uv(
+                triangle_uv, 0.2, 0.3, 0.5, reconstructed_u, reconstructed_v) ||
+            std::abs(reconstructed_u - 0.65) > 1e-12 ||
+            std::abs(reconstructed_v - 0.275) > 1e-12)
+        {
+            return 201;
+        }
         auto unsupported_schema = json;
         const std::string schema{paint_stroke_recording::Schema};
         const auto schema_pos = unsupported_schema.find(schema);
@@ -177,6 +262,21 @@ int main()
                 .ok)
         {
             return 197;
+        }
+        // Older archives have no geometry keys. They must keep their old
+        // semantics: u/v are the UV payload even when both are exactly zero.
+        const std::string legacy_json{
+            "{\"schema\":\"meccha_paint_strokes_v1\",\"source\":\"legacy\","
+            "\"count\":1,\"strokes\":[{\"u\":0,\"v\":0,\"radius\":0.01}]}"};
+        auto legacy = paint_stroke_recording::parse(
+            legacy_json,
+            [](const std::string&) { return static_cast<std::uintptr_t>(0); },
+            0);
+        if (!legacy.ok || legacy.has_uv.size() != 1 ||
+            legacy.has_uv[0] != 1 ||
+            !paint_stroke_recording::stroke_has_uv(legacy.strokes[0]))
+        {
+            return 202;
         }
     }
     {
