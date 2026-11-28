@@ -1281,6 +1281,10 @@ function initializeImageEditor() {
     button.addEventListener("click", () => runReusePaintCommand(button.dataset.reusePaintCommand)
       .catch(error => showError(error.message || String(error))));
   }
+  for (const button of document.querySelectorAll("[data-paint-recording-command]")) {
+    button.addEventListener("click", () => runPaintRecordingCommand(button.dataset.paintRecordingCommand)
+      .catch(error => showError(error.message || String(error))));
+  }
   for (const button of document.querySelectorAll("[data-reuse-paint-strategy]")) {
     button.addEventListener("click", () => {
       reusePaintStrategy = button.dataset.reusePaintStrategy;
@@ -2413,9 +2417,86 @@ let reusePaintStartPending = false;
 let reusePaintPreviewPending = false;
 let reusePaintStopPending = false;
 let reusePaintStopPreviewPending = false;
+let paintRecording = { active: false, strokeCount: 0, source: "", dropped: 0 };
+let paintRecordingPending = false;
+let paintRecordingPollTimer = null;
+let paintRecordingPollInFlight = false;
 
 function reusePaintPath() {
   return (byId("image-export-path")?.value || "").trim();
+}
+
+function paintRecordingStatusLabel() {
+  if (paintRecording.active) {
+    return i18n("recording.active", paintRecording.strokeCount);
+  }
+  if (paintRecording.strokeCount > 0) {
+    return i18n("recording.stopped", paintRecording.strokeCount);
+  }
+  return i18n("recording.idle");
+}
+
+function applyPaintRecordingStatus(result) {
+  if (!result) return;
+  paintRecording = {
+    active: Boolean(result.active),
+    strokeCount: Number(result.strokeCount || 0),
+    source: result.strokeSource || "",
+    dropped: Number(result.dropped || 0)
+  };
+  renderReusePaintControls();
+  updatePaintRecordingPoll();
+}
+
+function updatePaintRecordingPoll() {
+  if (paintRecording.active && paintRecordingPollTimer === null) {
+    paintRecordingPollTimer = setInterval(() => {
+      refreshPaintRecordingStatus().catch(() => {});
+    }, 1000);
+  } else if (!paintRecording.active && paintRecordingPollTimer !== null) {
+    clearInterval(paintRecordingPollTimer);
+    paintRecordingPollTimer = null;
+  }
+}
+
+async function refreshPaintRecordingStatus() {
+  if (paintRecordingPollInFlight) return;
+  paintRecordingPollInFlight = true;
+  try {
+    const result = await send("paintRecordingStatus");
+    if (result?.success) applyPaintRecordingStatus(result);
+  } finally {
+    paintRecordingPollInFlight = false;
+  }
+}
+
+async function runPaintRecordingCommand(command) {
+  if (paintRecordingPending) return;
+  paintRecordingPending = true;
+  renderReusePaintControls();
+  try {
+    if (command === "clear") {
+      const result = await send("clearPaintRecording", {}, 30000);
+      if (!result?.success) throw new Error(result?.message || "Recorded strokes could not be cleared.");
+      applyPaintRecordingStatus(result);
+      toast(i18n("toast.recording.cleared"));
+      return;
+    }
+    if (command === "stop") {
+      const result = await send("stopPaintRecording", {}, 120000);
+      if (!result?.success) throw new Error(result?.message || "Stroke recording could not be stopped.");
+      applyPaintRecordingStatus(result);
+      toast(i18n("toast.recording.stopped", result.strokeCount || 0));
+      return;
+    }
+    const result = await send("startPaintRecording", {}, 120000);
+    if (!result?.success) throw new Error(result?.message || "Stroke recording could not be started.");
+    applyPaintRecordingStatus(result);
+    toast(i18n("toast.recording.started"));
+  } finally {
+    paintRecordingPending = false;
+    renderReusePaintControls();
+  }
 }
 
 function renderReusePaintControls() {
@@ -2438,6 +2519,18 @@ function renderReusePaintControls() {
   if (preview) preview.disabled = !hasPath || running || reusePaintPreviewPending || reusePaintStartPending;
   const stopPreview = byId("image-reuse-stop-preview");
   if (stopPreview) stopPreview.disabled = running || activePreviewKind !== "reuse" || reusePaintStopPreviewPending || reusePaintStartPending;
+
+  const recordStart = byId("image-record-start");
+  if (recordStart) recordStart.disabled = running || paintRecordingPending || paintRecording.active;
+  const recordStop = byId("image-record-stop");
+  if (recordStop) recordStop.disabled = running || paintRecordingPending || !paintRecording.active;
+  const recordClear = byId("image-record-clear");
+  if (recordClear) recordClear.disabled = running || paintRecordingPending || (!paintRecording.active && paintRecording.strokeCount === 0);
+  const recordStatus = byId("image-record-status");
+  if (recordStatus) {
+    recordStatus.textContent = paintRecordingStatusLabel();
+    recordStatus.classList.toggle("active", paintRecording.active);
+  }
 }
 
 async function exportCurrentPaint() {

@@ -68,7 +68,10 @@ public sealed class HostSession
         string AlbedoPath,
         string PbrPath,
         int TextureSize,
-        string TempDirectory);
+        string TempDirectory,
+        string StrokesPath = "",
+        int StrokeCount = 0,
+        string StrokeSource = "");
 
     public HostSession(string version, int diagnosticStrokeLimit = 0)
     {
@@ -255,6 +258,109 @@ public sealed class HostSession
     public bool TryLoadImagePreset(string path, out ImagePaintSettings design, out string message) =>
         ImagePresets.TryLoadPreset(path, out design, out message);
 
+    public Task<PaintStrokeRecordingStatus> StartStrokeRecordingAsync(
+        bool restart = false,
+        CancellationToken cancellationToken = default) =>
+        SendStrokeRecordingCommandAsync(
+            JsonSerializer.Serialize(new
+            {
+                type = "start_stroke_recording",
+                restart
+            }),
+            TimeSpan.FromSeconds(120),
+            cancellationToken,
+            "start");
+
+    public Task<PaintStrokeRecordingStatus> StopStrokeRecordingAsync(
+        CancellationToken cancellationToken = default) =>
+        SendStrokeRecordingCommandAsync(
+            "{\"type\":\"stop_stroke_recording\"}",
+            TimeSpan.FromSeconds(120),
+            cancellationToken,
+            "stop");
+
+    public Task<PaintStrokeRecordingStatus> ClearStrokeRecordingAsync(
+        CancellationToken cancellationToken = default) =>
+        SendStrokeRecordingCommandAsync(
+            "{\"type\":\"clear_stroke_recording\"}",
+            TimeSpan.FromSeconds(120),
+            cancellationToken,
+            "clear");
+
+    public Task<PaintStrokeRecordingStatus> GetStrokeRecordingStatusAsync(
+        CancellationToken cancellationToken = default) =>
+        SendStrokeRecordingCommandAsync(
+            "{\"type\":\"stroke_recording_status\"}",
+            TimeSpan.FromSeconds(10),
+            cancellationToken,
+            "status");
+
+    private async Task<PaintStrokeRecordingStatus> SendStrokeRecordingCommandAsync(
+        string payload,
+        TimeSpan timeout,
+        CancellationToken cancellationToken,
+        string label)
+    {
+        try
+        {
+            using var process = Runtime.FindGameProcess(Settings.GameProcessName);
+            if (process is null)
+                return new PaintStrokeRecordingStatus(false, "Game process not found.", false, 0, "", 0);
+            if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
+                return new PaintStrokeRecordingStatus(false, "Bridge is not connected.", false, 0, "", 0);
+            var reply = await Runtime.SendPaintCommandAsync(payload, timeout, cancellationToken);
+            if (!reply.Ok || !reply.Success)
+            {
+                var failure = FriendlyBridgeMessage(
+                    reply.Message.Length > 0 ? reply.Message : reply.Stage);
+                Log.Warn($"Stroke recording {label} failed: {failure}");
+                return new PaintStrokeRecordingStatus(false, failure, false, 0, "", 0);
+            }
+            var status = ParseStrokeRecordingStatus(reply.Raw);
+            if (label == "start")
+                Log.Info($"Stroke recording started | count={status.StrokeCount} | source={status.Source}");
+            else if (label == "stop")
+                Log.Info($"Stroke recording stopped | count={status.StrokeCount} | source={status.Source}");
+            else if (label == "clear")
+                Log.Info("Stroke recording cleared.");
+            return status;
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Stroke recording {label} failed: " + ex.Message);
+            return new PaintStrokeRecordingStatus(false, ex.Message, false, 0, "", 0);
+        }
+    }
+
+    private static PaintStrokeRecordingStatus ParseStrokeRecordingStatus(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return new PaintStrokeRecordingStatus(true, "", false, 0, "", 0);
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            if (!document.RootElement.TryGetProperty("metadata", out var metadata) ||
+                metadata.ValueKind != JsonValueKind.Object)
+            {
+                return new PaintStrokeRecordingStatus(true, "", false, 0, "", 0);
+            }
+            var active = metadata.TryGetProperty("recording_active", out var activeElement) &&
+                         activeElement.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                         activeElement.GetBoolean();
+            var count = Int(metadata, "stroke_count", 0);
+            var source = Text(metadata, "stroke_source", "");
+            var dropped = metadata.TryGetProperty("strokes_dropped", out var droppedElement) &&
+                          droppedElement.TryGetInt64(out var droppedValue)
+                ? droppedValue
+                : 0L;
+            return new PaintStrokeRecordingStatus(true, "", active, count, source, dropped);
+        }
+        catch (JsonException)
+        {
+            return new PaintStrokeRecordingStatus(true, "", false, 0, "", 0);
+        }
+    }
+
     public async Task<PaintTextureExportResult> ExportCurrentPaintTextureAsync(CancellationToken cancellationToken = default)
     {
         lock (paintStateGate)
@@ -287,9 +393,26 @@ public sealed class HostSession
                 var mcpaint = Path.Combine(
                     directory,
                     "paint-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + PaintTextureArchive.Extension);
-                PaintTextureArchive.Write(mcpaint, result.ManifestPath, albedoRgba, pbrRgba, result.AlbedoPng, result.PbrPng);
-                Log.Info($"Paint texture exported | size={result.TextureSize} | file={mcpaint}");
-                return new PaintTextureExportResult(true, "", directory, mcpaint, "", "", result.TextureSize);
+                PaintTextureArchive.Write(
+                    mcpaint,
+                    result.ManifestPath,
+                    albedoRgba,
+                    pbrRgba,
+                    result.AlbedoPng,
+                    result.PbrPng,
+                    string.IsNullOrWhiteSpace(result.StrokesJson) ? null : result.StrokesJson);
+                Log.Info($"Paint texture exported | size={result.TextureSize} | strokes={result.StrokeCount} | file={mcpaint}");
+                return new PaintTextureExportResult(
+                    true,
+                    "",
+                    directory,
+                    mcpaint,
+                    "",
+                    "",
+                    result.TextureSize,
+                    result.StrokesJson,
+                    result.StrokeCount,
+                    result.StrokeSource);
             }
             finally
             {
@@ -316,7 +439,12 @@ public sealed class HostSession
             return new PaintTextureExportResult(false, "Game process not found.", "", "", "", "", 0);
         if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
             return new PaintTextureExportResult(false, "Bridge is not connected.", "", "", "", "", 0);
-        const string payload = "{\"type\":\"export_paint_texture\"}";
+        var strokesOutputPath = Path.Combine(outputDirectory, PaintStrokeFile.FileName);
+        var payload = JsonSerializer.Serialize(new
+        {
+            type = "export_paint_texture",
+            strokes_output_path = strokesOutputPath
+        });
         var reply = await Runtime.SendPaintCommandAsync(payload, TimeSpan.FromSeconds(120), cancellationToken);
         if (!reply.Ok || !reply.Success)
         {
@@ -329,6 +457,9 @@ public sealed class HostSession
         string albedoDump = "";
         string pbrDump = "";
         var size = 0;
+        var strokeCount = 0;
+        var strokeSource = "";
+        var strokesJsonPath = "";
         try
         {
             using var document = JsonDocument.Parse(reply.Raw);
@@ -340,6 +471,29 @@ public sealed class HostSession
             albedoDump = Text(metadata, "albedo_path", "");
             pbrDump = Text(metadata, "pbr_path", "");
             size = Int(metadata, "texture_size", 0);
+            strokeCount = Int(metadata, "stroke_count", 0);
+            strokeSource = Text(metadata, "stroke_source", "");
+            var reportedStrokesPath = Text(metadata, "strokes_path", "");
+            var strokesWritten = metadata.TryGetProperty("strokes_written", out var writtenElement) &&
+                                 writtenElement.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                                 writtenElement.GetBoolean();
+            if (strokesWritten &&
+                !string.IsNullOrWhiteSpace(reportedStrokesPath) &&
+                File.Exists(reportedStrokesPath) &&
+                PaintStrokeFile.TryReadSummary(reportedStrokesPath, out var strokeSummary, out _))
+            {
+                strokeCount = strokeSummary.Count;
+                if (!string.IsNullOrWhiteSpace(strokeSummary.Source))
+                    strokeSource = strokeSummary.Source;
+                strokesJsonPath = reportedStrokesPath;
+            }
+            else if (File.Exists(strokesOutputPath) &&
+                     PaintStrokeFile.TryReadSummary(strokesOutputPath, out var fallbackSummary, out _))
+            {
+                strokeCount = fallbackSummary.Count;
+                strokeSource = fallbackSummary.Source;
+                strokesJsonPath = strokesOutputPath;
+            }
         }
         catch (JsonException ex)
         {
@@ -394,6 +548,9 @@ public sealed class HostSession
                 pbr_rgba = Path.GetFileName(pbrRgbaPath),
                 albedo_png = Path.GetFileName(albedoPngPath),
                 pbr_png = Path.GetFileName(pbrPngPath),
+                stroke_count = strokeCount,
+                stroke_source = strokeSource,
+                strokes_file = string.IsNullOrWhiteSpace(strokesJsonPath) ? "" : PaintStrokeFile.FileName,
                 created_utc = DateTime.UtcNow
             });
             File.WriteAllText(manifestPath, manifest);
@@ -402,8 +559,18 @@ public sealed class HostSession
         {
             return new PaintTextureExportResult(false, "Could not save the exported texture: " + ex.Message, "", "", "", "", 0);
         }
-        Log.Info($"Paint texture exported | size={size} | manifest={manifestPath}");
-        return new PaintTextureExportResult(true, "", directory, manifestPath, albedoPngPath, pbrPngPath, size);
+        Log.Info($"Paint texture exported | size={size} | strokes={strokeCount} | manifest={manifestPath}");
+        return new PaintTextureExportResult(
+            true,
+            "",
+            directory,
+            manifestPath,
+            albedoPngPath,
+            pbrPngPath,
+            size,
+            strokesJsonPath,
+            strokeCount,
+            strokeSource);
     }
 
     public Task<PaintTextureImportResult> ImportPaintTextureAsync(
@@ -546,6 +713,39 @@ public sealed class HostSession
         return true;
     }
 
+    private static void TryReadPaintStrokesManifest(
+        string manifestPath,
+        out string strokesPath,
+        out int strokeCount,
+        out string strokeSource)
+    {
+        strokesPath = "";
+        strokeCount = 0;
+        strokeSource = "";
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
+            var root = document.RootElement;
+            var directory = Path.GetDirectoryName(Path.GetFullPath(manifestPath))!;
+            var declaredFile = Text(root, "strokes_file", "");
+            var candidate = Path.Combine(
+                directory,
+                string.IsNullOrWhiteSpace(declaredFile) ? PaintStrokeFile.FileName : declaredFile);
+            if (!File.Exists(candidate))
+                return;
+            if (!PaintStrokeFile.TryReadSummary(candidate, out var summary, out _))
+                return;
+            if (summary.Count <= 0)
+                return;
+            strokesPath = candidate;
+            strokeCount = summary.Count;
+            strokeSource = summary.Source;
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+        }
+    }
+
     private PaintTextureSource? TryPreparePaintTextureSource(string manifestPath, out string message)
     {
         message = "";
@@ -578,7 +778,20 @@ public sealed class HostSession
             }
             if (!TryReadPaintTextureManifest(manifestFile, out var albedoPath, out var pbrPath, out var size, out message))
                 return null;
-            return new PaintTextureSource(manifestFile, albedoPath, pbrPath, size, tempDirectory);
+            TryReadPaintStrokesManifest(
+                manifestFile,
+                out var strokesPath,
+                out var strokeCount,
+                out var strokeSource);
+            return new PaintTextureSource(
+                manifestFile,
+                albedoPath,
+                pbrPath,
+                size,
+                tempDirectory,
+                strokesPath,
+                strokeCount,
+                strokeSource);
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
@@ -654,6 +867,38 @@ public sealed class HostSession
         }
         try
         {
+            if (!string.IsNullOrWhiteSpace(source.StrokesPath) && source.StrokeCount > 0)
+            {
+                var exact = await ReplayRecordedStrokesAsync(
+                    source.StrokesPath,
+                    source.StrokeCount,
+                    source.StrokeSource,
+                    cancellationToken);
+                if (!exact.Success)
+                {
+                    Log.Warn("Reuse Paint failed: " +
+                             (string.IsNullOrWhiteSpace(exact.Message) ? "unknown error" : exact.Message));
+                    return new PaintTextureReuseResult(
+                        false,
+                        exact.Message,
+                        exact.Stage,
+                        false,
+                        false,
+                        exact.TextureSize,
+                        exact.StrokeCount,
+                        true);
+                }
+                return new PaintTextureReuseResult(
+                    true,
+                    exact.Message,
+                    exact.Stage,
+                    false,
+                    true,
+                    exact.TextureSize,
+                    exact.StrokeCount,
+                    true);
+            }
+
             double brushSizeTexels;
             double colorCompressionTolerance;
             lock (paintStateGate)
@@ -724,6 +969,154 @@ public sealed class HostSession
             previewOnly: false,
             unpreviewOnly: true,
             cancellationToken);
+    }
+
+    /// <summary>
+    /// Replays the exact PaintAtUVWithBrush values captured while the user was
+    /// painting. The host only transports the archive file; it never resamples
+    /// the texture, converts colour space, or re-compresses stroke channels.
+    /// </summary>
+    public async Task<PaintTextureReplayResult> ReplayRecordedStrokesAsync(
+        string strokesPath,
+        int expectedStrokeCount,
+        string strokeSource = "",
+        CancellationToken cancellationToken = default)
+    {
+        int runGeneration;
+        lock (paintStateGate)
+        {
+            if (PaintRunning || nativePaintMayBeRunning)
+            {
+                const string message = "Stop the active paint before replaying recorded strokes.";
+                Log.Warn("Paint replay failed: " + message);
+                return new PaintTextureReplayResult(false, message, "paint_running", 0, 0, true);
+            }
+            PaintRunning = true;
+            activePaintKind = PaintKind.Reuse;
+            runGeneration = ++nextPaintGeneration;
+            activePaintGeneration = runGeneration;
+            cancelState = PaintCancelState.None;
+            cancelPaintGeneration = 0;
+            paintRequestDispatchGeneration = 0;
+        }
+        currentPaintStartedAt = DateTimeOffset.UtcNow;
+        currentProgressIsServerPaint = true;
+        finalProgressLogged = false;
+        ResetReplayPassLog();
+        TryDeleteProgressSnapshot();
+        try
+        {
+            if (string.IsNullOrWhiteSpace(strokesPath) || !File.Exists(strokesPath))
+            {
+                const string failureMessage = "The recorded strokes file is missing.";
+                Log.Warn(failureMessage);
+                return new PaintTextureReplayResult(false, failureMessage, "strokes_missing", 0, 0, true);
+            }
+            using var process = Runtime.FindGameProcess(Settings.GameProcessName);
+            if (process is null)
+            {
+                const string failureMessage = "Game process not found.";
+                Log.Warn(failureMessage);
+                return new PaintTextureReplayResult(false, failureMessage, "process_missing", 0, 0, true);
+            }
+            if (!await Runtime.EnsureReadyAsync(process, cancellationToken))
+            {
+                const string failureMessage = "Bridge is not connected.";
+                Log.Warn(failureMessage);
+                return new PaintTextureReplayResult(false, failureMessage, "bridge_missing", 0, 0, true);
+            }
+            if (!TryBeginPaintDispatch(runGeneration))
+            {
+                const string failureMessage = "Paint: canceled.";
+                Log.Info(failureMessage);
+                return new PaintTextureReplayResult(false, failureMessage, "cancelled", 0, 0, true);
+            }
+
+            var payload = JsonSerializer.Serialize(new
+            {
+                type = "replay_recorded_strokes",
+                strokes_path = strokesPath,
+                stroke_count = expectedStrokeCount,
+                stroke_source = strokeSource
+            });
+            Log.Info($"Reuse Paint: replaying {expectedStrokeCount} recorded strokes exactly.");
+            var response = await Runtime.SendPaintAsync(payload, cancellationToken);
+            var message = FriendlyBridgeMessage(response.Message.Length > 0 ? response.Message : response.Stage);
+            var (replyTextureSize, strokeCount, usedStrategy, baseStrokes) = ParseReplayMetadata(response.Raw);
+            if (response.Success)
+            {
+                lock (paintStateGate)
+                {
+                    if (activePaintGeneration == runGeneration)
+                        nativePaintMayBeRunning = false;
+                }
+                LogFinalProgressOnce();
+                if (!string.IsNullOrEmpty(usedStrategy))
+                    Log.Info($"Reuse Paint exact replay | used={usedStrategy} | recorded strokes={baseStrokes}");
+                var completed = strokeCount > 0
+                    ? $"Reuse Paint: replayed {strokeCount} recorded strokes exactly | size={replyTextureSize}"
+                    : "Reuse Paint: recorded strokes replayed.";
+                Log.Info(completed);
+                return new PaintTextureReplayResult(
+                    true,
+                    completed,
+                    response.Stage,
+                    replyTextureSize,
+                    strokeCount,
+                    true);
+            }
+            if (IsPaintCancellationMessage(message))
+            {
+                lock (paintStateGate)
+                {
+                    if (activePaintGeneration == runGeneration)
+                        nativePaintMayBeRunning = false;
+                }
+                LogFinalProgressOnce();
+                Log.Info(message);
+                return new PaintTextureReplayResult(
+                    false,
+                    message,
+                    response.Stage,
+                    replyTextureSize,
+                    strokeCount,
+                    true);
+            }
+            lock (paintStateGate)
+            {
+                if (activePaintGeneration == runGeneration)
+                    nativePaintMayBeRunning = false;
+            }
+            LogFailureProgressOnce();
+            Log.Error(message);
+            var failureDetail = PaintFailureDetail(response);
+            if (failureDetail is not null)
+                Log.Warn("Paint replay detail: " + failureDetail);
+            return new PaintTextureReplayResult(
+                false,
+                message,
+                response.Stage,
+                replyTextureSize,
+                strokeCount,
+                true);
+        }
+        finally
+        {
+            lock (paintStateGate)
+            {
+                if (activePaintGeneration == runGeneration)
+                {
+                    PaintRunning = false;
+                    nativePaintMayBeRunning = false;
+                    activePaintKind = null;
+                    activePaintGeneration = 0;
+                    cancelState = PaintCancelState.None;
+                    cancelPaintGeneration = 0;
+                    paintRequestDispatchGeneration = 0;
+                }
+            }
+            currentProgressIsServerPaint = false;
+        }
     }
 
     public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync(

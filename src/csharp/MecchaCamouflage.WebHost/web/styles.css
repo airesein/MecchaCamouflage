@@ -911,6 +911,23 @@ body.editing #image-fill-section.disabled .field-label {
   grid-column: 1 / -1;
 }
 
+.record-status {
+  display: flex;
+  grid-column: 1 / -1;
+  min-width: 0;
+  align-items: center;
+  min-height: 20px;
+  color: var(--muted);
+  font: 500 13px/18px var(--font-ui);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-status.active {
+  color: var(--status-ok);
+}
+
 .danger-action:not(:disabled) {
   border-color: color-mix(in srgb, var(--error) 72%, var(--hairline));
   color: #ffabab;

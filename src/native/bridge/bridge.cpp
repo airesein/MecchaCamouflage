@@ -46,6 +46,7 @@
 
 #include "../include/sdk.hpp"
 #include "../include/direct_bridge_abi.hpp"
+#include "../include/paint_stroke_recording.hpp"
 #include "../include/paint_texture_replay.hpp"
 #include "../include/runtime_contract.hpp"
 
@@ -392,6 +393,85 @@ namespace
     std::atomic<bool> g_auto_event_watch_writer_running{false};
     std::atomic<std::uint64_t> g_auto_event_watch_generation{0};
     std::thread g_auto_event_watch_writer{};
+
+    // =============================================================================
+    // Section: Original paint-stroke recording
+    // Risk: high. The ProcessEvent detour runs on the game thread and appends the
+    // local paint component's raw PaintAtUVWithBrush parameters while the user
+    // records. No colour blending, sRGB conversion, resampling, or compression is
+    // performed here; Reuse Paint feeds these exact values back to the game.
+    // =============================================================================
+
+    constexpr std::size_t MaxRecordedPaintStrokes = paint_stroke_recording::MaxStrokes;
+
+    std::mutex g_recorded_strokes_mutex;
+    std::vector<sdk::FPaintStroke> g_recorded_strokes{};
+    std::atomic<bool> g_recorded_strokes_active{false};
+    std::atomic<std::uintptr_t> g_recorded_strokes_component{0};
+    std::atomic<std::uintptr_t> g_recorded_strokes_function{0};
+    std::atomic<int> g_recorded_strokes_count{0};
+    std::atomic<std::uint64_t> g_recorded_strokes_dropped{0};
+    // Reuse Paint submits strokes through the verified original ProcessEvent
+    // entry point. The suppression counter is an additional guard in case a
+    // future call path goes through the patched vtable instead.
+    std::atomic<int> g_recorded_strokes_suppress{0};
+    std::atomic<bool> g_recorded_strokes_hook_owned{false};
+    std::mutex g_recorded_strokes_source_mutex;
+    std::string g_recorded_strokes_source{"none"};
+
+    auto recorded_strokes_set_source(const std::string& source) -> void
+    {
+        std::lock_guard<std::mutex> lock(g_recorded_strokes_source_mutex);
+        g_recorded_strokes_source = source.empty() ? "none" : source;
+    }
+
+    auto recorded_strokes_source() -> std::string
+    {
+        std::lock_guard<std::mutex> lock(g_recorded_strokes_source_mutex);
+        return g_recorded_strokes_source;
+    }
+
+    auto recorded_strokes_clear() -> void
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_recorded_strokes_mutex);
+            g_recorded_strokes.clear();
+            g_recorded_strokes.shrink_to_fit();
+        }
+        g_recorded_strokes_count.store(0, std::memory_order_release);
+        g_recorded_strokes_dropped.store(0, std::memory_order_release);
+    }
+
+    auto recorded_strokes_capture(
+        const sdk::RuntimePaintableComponent_PaintAtUVWithBrush& params) -> void
+    {
+        if (!g_recorded_strokes_active.load(std::memory_order_acquire) ||
+            g_recorded_strokes_suppress.load(std::memory_order_acquire) > 0)
+        {
+            return;
+        }
+        if (!std::isfinite(params.Uv.X) || !std::isfinite(params.Uv.Y))
+        {
+            return;
+        }
+        sdk::FPaintStroke stroke{};
+        stroke.Uv = params.Uv;
+        stroke.ChannelData = params.ChannelData;
+        stroke.BrushSettings = params.BrushSettings;
+        stroke.TargetChannel = params.Channel;
+        {
+            std::lock_guard<std::mutex> lock(g_recorded_strokes_mutex);
+            if (g_recorded_strokes.size() >= MaxRecordedPaintStrokes)
+            {
+                g_recorded_strokes_dropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            g_recorded_strokes.push_back(stroke);
+            g_recorded_strokes_count.store(
+                static_cast<int>(g_recorded_strokes.size()),
+                std::memory_order_release);
+        }
+    }
 
     using ProcessEventFn = void(__fastcall*)(void*, void*, void*);
     using DxgiPresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -953,6 +1033,10 @@ namespace
     auto import_paint_texture_on_game_thread(const std::string& request) -> std::string;
     auto is_export_paint_texture_request(const std::string& request) -> bool;
     auto export_paint_texture_on_game_thread(const std::string& request) -> std::string;
+    auto is_replay_recorded_strokes_request(const std::string& request) -> bool;
+    auto replay_recorded_strokes_on_game_thread(
+        const std::string& request,
+        const std::shared_ptr<QueuedPaintJob>& queued_job) -> std::string;
     auto auto_event_watch_record(std::uintptr_t object_address,
                                  std::uintptr_t function_address,
                                  std::uint8_t* params_bytes) -> void;
@@ -3841,8 +3925,14 @@ namespace
         return true;
     }
 
-    auto install_process_event_vtable_hook_for_object(std::uintptr_t object, std::string& failure) -> bool
+    auto install_process_event_vtable_hook_for_object(std::uintptr_t object,
+                                                      std::string& failure,
+                                                      bool* installed_new = nullptr) -> bool
     {
+        if (installed_new)
+        {
+            *installed_new = false;
+        }
         if (!live_uobject(object))
         {
             failure = "hook_object_unavailable";
@@ -3891,6 +3981,53 @@ namespace
         VirtualProtect(slot, sizeof(std::uintptr_t), old_protect, &ignored);
         g_original_process_event.store(original);
         g_process_event_hook_slots.push_back({slot_address, original});
+        if (installed_new)
+        {
+            *installed_new = true;
+        }
+        return true;
+    }
+
+    auto uninstall_process_event_vtable_hook_for_object(std::uintptr_t object) -> bool
+    {
+        if (!live_uobject(object))
+        {
+            return false;
+        }
+        const auto vtable = safe_read<std::uintptr_t>(object);
+        if (!vtable)
+        {
+            return false;
+        }
+        const auto slot_address =
+            vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t);
+        const auto hook = reinterpret_cast<std::uintptr_t>(&hooked_process_event);
+        std::lock_guard<std::mutex> hook_lock(g_hook_mutex);
+        for (auto entry = g_process_event_hook_slots.begin();
+             entry != g_process_event_hook_slots.end();
+             ++entry)
+        {
+            if (entry->first != slot_address)
+            {
+                continue;
+            }
+            auto* slot = reinterpret_cast<std::uintptr_t*>(slot_address);
+            DWORD old_protect = 0;
+            if (VirtualProtect(slot, sizeof(std::uintptr_t), PAGE_EXECUTE_READWRITE, &old_protect))
+            {
+                if (safe_read<std::uintptr_t>(slot_address) == hook)
+                {
+                    *slot = entry->second;
+                    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(std::uintptr_t));
+                }
+                DWORD ignored = 0;
+                VirtualProtect(slot, sizeof(std::uintptr_t), old_protect, &ignored);
+            }
+            g_process_event_hook_slots.erase(entry);
+            // Retain g_original_process_event for a callback already admitted
+            // before the slot was restored.
+            return true;
+        }
         return true;
     }
 
@@ -6553,7 +6690,8 @@ namespace
     auto sdk_call_paint_at_uv_with_brush(std::uintptr_t component,
                                          std::uintptr_t function,
                                          const sdk::FPaintStroke& stroke,
-                                         std::string& failure) -> bool;
+                                         std::string& failure,
+                                         bool allow_recording = true) -> bool;
 
     auto sdk_resolve_skinned_pose(Reflection& ref,
                                   std::uintptr_t mesh,
@@ -15084,6 +15222,9 @@ namespace
         int local_dispatch_peak_delay_ms{runtime_contract::FastLocalCadenceMs};
         int local_dispatch_throttle_events{0};
         std::string local_visual_sync_failure{};
+        // A texture or recorded-stroke Reuse Paint job must never feed its own
+        // replay back into the user's recording.
+        bool suppress_stroke_recording{false};
         bool local_sync_started{false};
         std::chrono::steady_clock::time_point started{};
         std::chrono::steady_clock::time_point local_sync_started_at{};
@@ -24547,6 +24688,7 @@ namespace
         async_job->component_outer = safe_read<std::uintptr_t>(ctx.component + OffOuter);
         async_job->k2_get_pawn_function = ctx.k2_get_pawn_function;
         async_job->local_paint_at_uv_function = ctx.local_paint_at_uv_function;
+        async_job->suppress_stroke_recording = true;
         async_job->direct_queue_manager =
             ref.find_first_instance("RuntimePaintReplicationManager");
         async_job->direct_recorded_count_function =
@@ -24728,14 +24870,628 @@ namespace
             return true;
         }
         const auto response =
-            is_replay_paint_texture_request(request)
-                ? replay_paint_texture_on_game_thread(request, queued_job)
-                : paint_mesh_first_on_game_thread(request, queued_job);
+            is_replay_recorded_strokes_request(request)
+                ? replay_recorded_strokes_on_game_thread(request, queued_job)
+                : is_replay_paint_texture_request(request)
+                      ? replay_paint_texture_on_game_thread(request, queued_job)
+                      : paint_mesh_first_on_game_thread(request, queued_job);
         if (!response.empty())
         {
             complete_queued_paint_job(queued_job, response);
         }
         return true;
+    }
+
+    auto is_start_stroke_recording_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"start_stroke_recording\"") != std::string::npos;
+    }
+
+    auto is_stop_stroke_recording_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"stop_stroke_recording\"") != std::string::npos;
+    }
+
+    auto is_clear_stroke_recording_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"clear_stroke_recording\"") != std::string::npos;
+    }
+
+    auto is_export_strokes_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"export_strokes\"") != std::string::npos;
+    }
+
+    auto is_replay_recorded_strokes_request(const std::string& request) -> bool
+    {
+        return request.find("\"type\":\"replay_recorded_strokes\"") != std::string::npos;
+    }
+
+    auto recorded_stroke_metadata(const char* route) -> std::string
+    {
+        return "\"route\":\"" + std::string(route ? route : "stroke_recording") + "\"" +
+               ",\"recording_active\":" +
+                   std::string(json_bool(g_recorded_strokes_active.load(std::memory_order_acquire))) +
+               ",\"stroke_count\":" +
+                   std::to_string(g_recorded_strokes_count.load(std::memory_order_acquire)) +
+               ",\"stroke_source\":\"" + json_escape(recorded_strokes_source()) + "\"" +
+               ",\"strokes_dropped\":" +
+                   std::to_string(g_recorded_strokes_dropped.load(std::memory_order_acquire));
+    }
+
+    auto recorded_strokes_snapshot() -> std::vector<sdk::FPaintStroke>
+    {
+        std::lock_guard<std::mutex> lock(g_recorded_strokes_mutex);
+        return g_recorded_strokes;
+    }
+
+    auto recorded_strokes_write_file(const std::wstring& path) -> bool
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+        const auto snapshot = recorded_strokes_snapshot();
+        Reflection ref{};
+        std::string reflection_failure{};
+        const bool reflection_ready = ref.init(reflection_failure);
+        std::unordered_map<std::uintptr_t, std::string> path_cache{};
+        const auto resolve_path = [&](std::uintptr_t pointer) -> std::string {
+            if (pointer == 0 || !reflection_ready)
+            {
+                return {};
+            }
+            const auto cached = path_cache.find(pointer);
+            if (cached != path_cache.end())
+            {
+                return cached->second;
+            }
+            std::string resolved{};
+            if (live_uobject(pointer))
+            {
+                resolved = ref.object_path(pointer);
+            }
+            path_cache.emplace(pointer, resolved);
+            return resolved;
+        };
+        const auto json = paint_stroke_recording::serialize(
+            snapshot,
+            recorded_strokes_source(),
+            g_recorded_strokes_dropped.load(std::memory_order_acquire),
+            resolve_path);
+        return write_text_file_w(path, json);
+    }
+
+    auto start_stroke_recording_on_game_thread(const std::string& request) -> std::string
+    {
+        const bool restart = json_bool_field(request, "restart", false);
+        if (g_recorded_strokes_active.load(std::memory_order_acquire) && !restart)
+        {
+            return response_json(true,
+                                 "stroke_recording_active",
+                                 0,
+                                 0,
+                                 "stroke recording is already active",
+                                 recorded_stroke_metadata("start_stroke_recording"));
+        }
+        Reflection ref{};
+        std::string failure{};
+        if (!ref.init(failure))
+        {
+            return response_json(false,
+                                 "sdk_update_required",
+                                 0,
+                                 1,
+                                 failure.empty() ? "SDK reflection init failed" : failure,
+                                 "\"route\":\"start_stroke_recording\"");
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            return response_json(false,
+                                 ex.stage.c_str(),
+                                 0,
+                                 1,
+                                 ex.what(),
+                                 "\"route\":\"start_stroke_recording\",\"sdk_resolution_exception\":true");
+        }
+        if (!ctx.ok)
+        {
+            return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message,
+                                 "\"route\":\"start_stroke_recording\"");
+        }
+        if (!ctx.local_paint_at_uv_function)
+        {
+            return response_json(false,
+                                 "PaintAtUVWithBrush_unavailable",
+                                 0,
+                                 1,
+                                 "PaintAtUVWithBrush is unavailable; recording cannot start",
+                                 "\"route\":\"start_stroke_recording\"");
+        }
+        std::string hook_failure{};
+        bool installed_new_hook = false;
+        if (!install_process_event_vtable_hook_for_object(
+                ctx.component, hook_failure, &installed_new_hook))
+        {
+            return response_json(false,
+                                 "stroke_recording_hook_failed",
+                                 0,
+                                 1,
+                                 hook_failure.empty()
+                                     ? "the ProcessEvent detour could not be installed"
+                                     : hook_failure,
+                                 "\"route\":\"start_stroke_recording\"");
+        }
+        if (installed_new_hook)
+        {
+            g_recorded_strokes_hook_owned.store(true, std::memory_order_release);
+        }
+        recorded_strokes_clear();
+        g_recorded_strokes_component.store(ctx.component, std::memory_order_release);
+        g_recorded_strokes_function.store(ctx.local_paint_at_uv_function, std::memory_order_release);
+        recorded_strokes_set_source(paint_stroke_recording::NativeSource);
+        g_recorded_strokes_active.store(true, std::memory_order_release);
+        std::string metadata = recorded_stroke_metadata("start_stroke_recording");
+        metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
+        metadata += ",\"paint_function\":\"" + hex_address(ctx.local_paint_at_uv_function) + "\"";
+        metadata += ",\"recording_source\":\"process_event_detour\"";
+        metadata += ",\"recording_full_history_required\":true";
+        return response_json(true,
+                             "stroke_recording_started",
+                             0,
+                             0,
+                             "stroke recording started",
+                             metadata);
+    }
+
+    auto stop_stroke_recording_on_game_thread() -> std::string
+    {
+        const bool was_active =
+            g_recorded_strokes_active.exchange(false, std::memory_order_acq_rel);
+        if (g_recorded_strokes_hook_owned.exchange(false, std::memory_order_acq_rel))
+        {
+            uninstall_process_event_vtable_hook_for_object(
+                g_recorded_strokes_component.load(std::memory_order_acquire));
+        }
+        std::string metadata = recorded_stroke_metadata("stop_stroke_recording");
+        metadata += ",\"was_active\":" + std::string(json_bool(was_active));
+        metadata += ",\"recording_full_history_retained\":true";
+        metadata += ",\"recording_hook_uninstalled\":true";
+        return response_json(true,
+                             "stroke_recording_stopped",
+                             0,
+                             0,
+                             was_active ? "stroke recording stopped" : "stroke recording was not active",
+                             metadata);
+    }
+
+    auto clear_stroke_recording_on_game_thread() -> std::string
+    {
+        recorded_strokes_clear();
+        return response_json(true,
+                             "stroke_recording_cleared",
+                             0,
+                             0,
+                             "recorded strokes cleared",
+                             recorded_stroke_metadata("clear_stroke_recording"));
+    }
+
+    auto export_strokes_on_game_thread(const std::string& request) -> std::string
+    {
+        auto path_text = json_string_field(request, "output_path", "");
+        std::wstring path{};
+        if (!path_text.empty())
+        {
+            path = utf8_to_wstring(path_text);
+        }
+        else
+        {
+            const auto directory = runtime_log_dir_path();
+            if (!directory.empty())
+            {
+                path = directory + L"\\paint-strokes-" +
+                       std::to_wstring(GetTickCount64()) + L".json";
+            }
+        }
+        if (path.empty())
+        {
+            return response_json(false,
+                                 "export_strokes_path_unavailable",
+                                 0,
+                                 1,
+                                 "no strokes output path was provided and the runtime log directory is unavailable",
+                                 recorded_stroke_metadata("export_strokes"));
+        }
+        if (g_recorded_strokes_count.load(std::memory_order_acquire) <= 0)
+        {
+            std::string metadata = recorded_stroke_metadata("export_strokes");
+            metadata += ",\"strokes_path\":\"\"";
+            metadata += ",\"strokes_written\":false";
+            return response_json(true,
+                                 "export_strokes_empty",
+                                 0,
+                                 0,
+                                 "no recorded strokes are available",
+                                 metadata);
+        }
+        if (!recorded_strokes_write_file(path))
+        {
+            return response_json(false,
+                                 "export_strokes_write_failed",
+                                 0,
+                                 1,
+                                 "could not write the recorded strokes file",
+                                 recorded_stroke_metadata("export_strokes") +
+                                     ",\"strokes_path\":\"" +
+                                     json_escape(wstring_to_utf8(path)) + "\"");
+        }
+        std::string metadata = recorded_stroke_metadata("export_strokes");
+        metadata += ",\"strokes_path\":\"" + json_escape(wstring_to_utf8(path)) + "\"";
+        metadata += ",\"strokes_written\":true";
+        metadata += ",\"strokes_schema\":\"" + std::string(paint_stroke_recording::Schema) + "\"";
+        return response_json(true,
+                             "export_strokes",
+                             0,
+                             0,
+                             "recorded strokes exported",
+                             metadata);
+    }
+
+    auto recorded_strokes_find_texture_by_path(Reflection& ref,
+                                               const std::string& path,
+                                               std::unordered_map<std::string, std::uintptr_t>& cache)
+        -> std::uintptr_t
+    {
+        if (path.empty())
+        {
+            return 0;
+        }
+        const auto wanted = lower_copy(path);
+        const auto cached = cache.find(wanted);
+        if (cached != cache.end())
+        {
+            return cached->second;
+        }
+        std::uintptr_t found = 0;
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!live_uobject(object))
+            {
+                return false;
+            }
+            if (lower_copy(ref.object_path(object)) == wanted)
+            {
+                found = object;
+                return true;
+            }
+            return false;
+        });
+        cache.emplace(wanted, found);
+        return found;
+    }
+
+    auto replay_recorded_strokes_on_game_thread(
+        const std::string& request,
+        const std::shared_ptr<QueuedPaintJob>& queued_job) -> std::string
+    {
+        const auto total_preprocess_start =
+            std::chrono::high_resolution_clock::now();
+        if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+        {
+            return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+        }
+        if (!queued_job)
+        {
+            return response_json(false,
+                                 "recorded_stroke_async_required",
+                                 0,
+                                 1,
+                                 "recorded-stroke replay requires the async queued dispatcher",
+                                 "\"route\":\"replay_recorded_strokes\",\"replay_blocked\":true");
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
+            if (g_mesh_first_batch_job)
+            {
+                return response_json(false,
+                                     "mesh_first_busy",
+                                     0,
+                                     1,
+                                     "recorded-stroke replay is already running",
+                                     "\"route\":\"replay_recorded_strokes\",\"replay_blocked\":true");
+            }
+        }
+
+        const auto strokes_path_text = json_string_field(request, "strokes_path", "");
+        if (strokes_path_text.empty())
+        {
+            return response_json(false,
+                                 "recorded_strokes_path_missing",
+                                 0,
+                                 1,
+                                 "replay_recorded_strokes requires a strokes_path",
+                                 "\"route\":\"replay_recorded_strokes\"");
+        }
+        std::vector<std::uint8_t> stroke_bytes{};
+        if (!read_binary_file_w(utf8_to_wstring(strokes_path_text), stroke_bytes) ||
+            stroke_bytes.empty())
+        {
+            return response_json(false,
+                                 "recorded_strokes_unreadable",
+                                 0,
+                                 1,
+                                 "could not read the recorded strokes file",
+                                 "\"route\":\"replay_recorded_strokes\",\"strokes_path\":\"" +
+                                     json_escape(strokes_path_text) + "\"");
+        }
+        const std::string stroke_json(stroke_bytes.begin(), stroke_bytes.end());
+        const int requested_texture_size =
+            json_int_field(request, "texture_size", 1024, 1, 8192);
+
+        std::string metadata = "\"route\":\"replay_recorded_strokes\"";
+        metadata += ",\"replay_route\":\"recorded_stroke_exact_replay\"";
+        metadata += ",\"exact_stroke_replay\":true";
+        metadata += ",\"replay_texture_resampling\":false";
+        metadata += ",\"replay_color_conversion\":false";
+        metadata += ",\"replay_compression\":false";
+        metadata += ",\"replay_alpha_skipping\":false";
+        metadata += ",\"recorded_strokes_path\":\"" + json_escape(strokes_path_text) + "\"";
+        metadata += ",\"texture_size\":" + std::to_string(requested_texture_size);
+
+        Reflection ref{};
+        std::string failure{};
+        if (!ref.init(failure))
+        {
+            return response_json(false,
+                                 "sdk_update_required",
+                                 0,
+                                 1,
+                                 failure.empty() ? "SDK reflection init failed" : failure,
+                                 metadata + ",\"sdk_resolution_exception\":true");
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            return response_json(false,
+                                 ex.stage.c_str(),
+                                 0,
+                                 1,
+                                 ex.what(),
+                                 metadata + ",\"sdk_resolution_exception\":true");
+        }
+        if (!ctx.ok)
+        {
+            return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, metadata);
+        }
+        if (!ctx.local_paint_at_uv_function)
+        {
+            return response_json(false,
+                                 "mesh_direct_paint_unavailable",
+                                 0,
+                                 1,
+                                 "PaintAtUVWithBrush is unavailable; recorded-stroke replay cannot run",
+                                 metadata + ",\"replay_blocked\":true");
+        }
+        metadata += ",\"component\":\"" + hex_address(ctx.component) + "\"";
+
+        sdk::FRuntimeBrushSettings current_brush{};
+        safe_copy(&current_brush,
+                  reinterpret_cast<const void*>(
+                      ctx.component +
+                      sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings),
+                  sizeof(current_brush));
+        const auto fallback_brush_texture =
+            reinterpret_cast<std::uintptr_t>(current_brush.BrushTexture);
+        std::unordered_map<std::string, std::uintptr_t> texture_path_cache{};
+        const auto lookup_texture = [&](const std::string& path) -> std::uintptr_t {
+            return recorded_strokes_find_texture_by_path(ref, path, texture_path_cache);
+        };
+        auto parsed = paint_stroke_recording::parse(
+            stroke_json, lookup_texture, fallback_brush_texture);
+        if (!parsed.ok)
+        {
+            return response_json(false,
+                                 "recorded_strokes_invalid",
+                                 0,
+                                 1,
+                                 parsed.failure.empty()
+                                     ? "the recorded strokes file is invalid"
+                                     : parsed.failure,
+                                 metadata);
+        }
+        metadata += ",\"recorded_strokes_source\":\"" + json_escape(parsed.source) + "\"";
+        metadata += ",\"recorded_strokes_declared\":" + std::to_string(parsed.declared_count);
+        metadata += ",\"recorded_strokes_dropped\":" + std::to_string(parsed.dropped);
+        metadata += ",\"replay_strokes_total\":" + std::to_string(parsed.strokes.size());
+        metadata += ",\"replay_strategy_requested\":\"recorded\"";
+        metadata += ",\"replay_strategy_used\":\"recorded_strokes\"";
+        metadata += ",\"replay_base_strokes\":0";
+        metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
+        metadata += ",\"local_route_mode\":\"native_recorded_paint\"";
+        metadata += ",\"authoritative_replay\":\"direct_game_recorded_strokes\"";
+        metadata += ",\"local_texture_import_required\":false";
+
+        auto async_job = std::make_shared<MeshFirstServerBatchAsyncJob>();
+        async_job->queued = queued_job;
+        async_job->controller = ctx.controller;
+        async_job->pawn = ctx.pawn;
+        async_job->component = ctx.component;
+        async_job->component_class = safe_read<std::uintptr_t>(ctx.component + OffClass);
+        async_job->component_outer = safe_read<std::uintptr_t>(ctx.component + OffOuter);
+        async_job->k2_get_pawn_function = ctx.k2_get_pawn_function;
+        async_job->local_paint_at_uv_function = ctx.local_paint_at_uv_function;
+        async_job->suppress_stroke_recording = true;
+        async_job->direct_queue_manager =
+            ref.find_first_instance("RuntimePaintReplicationManager");
+        async_job->direct_recorded_count_function =
+            ref.find_function(ctx.component, "GetRecordedStrokeCount");
+        if (live_uobject(async_job->direct_queue_manager))
+        {
+            async_job->direct_queue_component_count_function =
+                ref.find_function(async_job->direct_queue_manager,
+                                  "GetQueuedStrokeCountForComponent");
+            async_job->direct_queue_manager_count_function =
+                ref.find_function(async_job->direct_queue_manager,
+                                  "GetQueuedStrokeCount");
+            async_job->direct_queue_pressure_function =
+                ref.find_function(async_job->direct_queue_manager,
+                                  "GetReplicationPressure");
+            if (const auto outgoing_batches_property =
+                    find_object_property(
+                        ref,
+                        async_job->direct_queue_manager,
+                        "QueuedOutgoingBatches"))
+            {
+                async_job->direct_queue_outgoing_batches_offset =
+                    prop_offset(outgoing_batches_property);
+            }
+        }
+        const int reported_batches_per_second =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxOutgoingNetworkBatchesPerSecond",
+                -1);
+        const int reported_strokes_per_batch =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxOutgoingStrokesPerBatch",
+                -1);
+        const int min_remote_frames_after_local_paint =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MinRemotePaintFramesAfterLocalPaint",
+                0);
+        const int max_adaptive_remote_frame_interval =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxAdaptiveRemotePaintFrameInterval",
+                0);
+        async_job->reported_max_render_target_writes_per_frame =
+            read_object_i32_property(
+                ref,
+                async_job->direct_queue_manager,
+                "MaxReplicatedPaintRenderTargetWritesPerFrame",
+                -1);
+        bool adaptive_remote_interval = false;
+        if (const auto adaptive_property =
+                find_object_property(
+                    ref,
+                    async_job->direct_queue_manager,
+                    "bEnableAdaptiveRemotePaintInterval"))
+        {
+            sdk_read_reflected_bool(
+                adaptive_property,
+                reinterpret_cast<const std::uint8_t*>(
+                    async_job->direct_queue_manager),
+                adaptive_remote_interval);
+        }
+        async_job->replication_pacing =
+            runtime_contract::paint_replication_pacing_plan(
+                reported_batches_per_second,
+                reported_strokes_per_batch,
+                async_job->reported_max_render_target_writes_per_frame,
+                runtime_contract::NativeRecordedPaintMaxCallsPerTick,
+                min_remote_frames_after_local_paint,
+                adaptive_remote_interval,
+                max_adaptive_remote_frame_interval);
+        async_job->local_dispatch_delay_ms =
+            async_job->replication_pacing.cadence_ms;
+        async_job->local_dispatch_peak_delay_ms =
+            async_job->replication_pacing.cadence_ms;
+        async_job->strokes = std::move(parsed.strokes);
+        async_job->initial_stroke_count =
+            static_cast<int>(async_job->strokes.size());
+        async_job->metadata =
+            metadata +
+            ",\"local_visual_sync_mode\":\"paint_at_uv_with_brush_native_replication\"" +
+            ",\"local_batch_strategy\":\"single_direct_lane\"" +
+            ",\"native_queue_backpressure\":true";
+        async_job->texture_size = requested_texture_size;
+        async_job->replay_front = 0;
+        async_job->replay_side = 0;
+        async_job->replay_back = 0;
+        async_job->replay_fill_end = 0;
+        const int local_sample_batch_limit =
+            async_job->replication_pacing.calls_per_tick;
+        async_job->local_render_target_write_budget =
+            local_sample_batch_limit *
+            std::max(1,
+                     runtime_contract::paint_channel_write_cost(
+                         static_cast<int>(
+                             sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive)));
+        if (async_job->reported_max_render_target_writes_per_frame > 0)
+        {
+            async_job->local_render_target_write_budget =
+                std::min(
+                    async_job->local_render_target_write_budget,
+                    async_job->reported_max_render_target_writes_per_frame);
+        }
+        async_job->metadata +=
+            ",\"local_logical_sample_batch_limit\":" +
+            std::to_string(local_sample_batch_limit);
+        async_job->metadata +=
+            ",\"replication_pacing_source\":\"" +
+            std::string(
+                reported_batches_per_second > 0 &&
+                        reported_strokes_per_batch > 0 &&
+                        async_job->reported_max_render_target_writes_per_frame > 0
+                    ? "reflected_network_and_receiver_limits"
+                    : "supported_build_fallback") +
+            "\"";
+        async_job->metadata +=
+            ",\"native_queue_component_counter_available\":" +
+            std::string(json_bool(async_job->direct_queue_component_count_function != 0));
+        const double total_preprocess_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() -
+                total_preprocess_start)
+                .count();
+        async_job->preprocessing_ms = total_preprocess_ms;
+        async_job->metadata +=
+            ",\"preprocessing_ms\":" + std::to_string(total_preprocess_ms);
+        async_job->started = std::chrono::steady_clock::now();
+        async_job->local_sync_started = true;
+        async_job->local_sync_started_at = async_job->started;
+        async_job->phase = MeshFirstBatchPhase::LocalPaint;
+        {
+            std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
+            if (!g_accepting_bridge_commands.load(std::memory_order_acquire) &&
+                queued_paint_cancel_reason(queued_job) == PaintCancelReason::None)
+            {
+                request_queued_paint_cancel(queued_job, "bridge_stopping");
+            }
+            if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
+            {
+                return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
+            }
+            g_mesh_first_batch_job = async_job;
+            queued_job->state.store(static_cast<int>(PaintJobState::Async),
+                                    std::memory_order_release);
+        }
+        write_bridge_progress(
+            "mesh_direct_paint_begin",
+            "recorded paint strokes prepared",
+            0,
+            static_cast<int>(async_job->strokes.size()),
+            0.0,
+            mesh_first_progress_extra(async_job,
+                                      async_job->phase,
+                                      false,
+                                      "running"));
+        post_paint_dispatch_message();
+        return {};
     }
 
     auto mesh_first_cancel_response(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
@@ -25103,7 +25859,8 @@ namespace
             if (!sdk_call_paint_at_uv_with_brush(job->component,
                                                  job->local_paint_at_uv_function,
                                                  stroke,
-                                                 failure))
+                                                 failure,
+                                                 !job->suppress_stroke_recording))
             {
                 ++job->local_stroke_failures;
                 job->local_visual_sync_failure =
@@ -26628,7 +27385,8 @@ namespace
     auto sdk_call_paint_at_uv_with_brush(std::uintptr_t component,
                                          std::uintptr_t function,
                                          const sdk::FPaintStroke& stroke,
-                                         std::string& failure) -> bool
+                                         std::string& failure,
+                                         bool allow_recording) -> bool
     {
         if (!function)
         {
@@ -26651,7 +27409,17 @@ namespace
         params.ChannelData = stroke.ChannelData;
         params.BrushSettings = stroke.BrushSettings;
         params.Channel = stroke.TargetChannel;
-        return process_event(component, function, reinterpret_cast<std::uint8_t*>(&params), failure);
+        const bool ok =
+            process_event(component, function, reinterpret_cast<std::uint8_t*>(&params), failure);
+        // The app's own normal paint is part of the session the user may want to
+        // reuse. Reuse Paint passes allow_recording=false so its replay never
+        // appends to the recording.
+        if (ok && allow_recording &&
+            g_recorded_strokes_active.load(std::memory_order_acquire))
+        {
+            recorded_strokes_capture(params);
+        }
+        return ok;
     }
 
     struct SdkFrontColorStats
@@ -29600,7 +30368,7 @@ namespace
         return request.find("\"type\":\"export_paint_texture\"") != std::string::npos;
     }
 
-    auto export_paint_texture_on_game_thread(const std::string&) -> std::string
+    auto export_paint_texture_on_game_thread(const std::string& request) -> std::string
     {
         Reflection ref{};
         std::string failure{};
@@ -29704,6 +30472,38 @@ namespace
         metadata += ",\"pbr_path\":\"" + json_escape(wstring_to_utf8(pbr_path)) + "\"";
         metadata += ",\"albedo_bytes\":" + std::to_string(albedo.bytes.size());
         metadata += ",\"pbr_bytes\":" + std::to_string(packed_pbr.bytes.size());
+
+        // Export Paint also carries the raw recorded brush history when the
+        // user was recording while painting. Older sessions simply have no
+        // strokes and continue to rely on the texture replay fallback.
+        const int recorded_count =
+            g_recorded_strokes_count.load(std::memory_order_acquire);
+        const auto recorded_source = recorded_strokes_source();
+        metadata += ",\"stroke_count\":" + std::to_string(recorded_count);
+        metadata += ",\"stroke_source\":\"" + json_escape(recorded_source) + "\"";
+        metadata += ",\"strokes_dropped\":" +
+                    std::to_string(g_recorded_strokes_dropped.load(std::memory_order_acquire));
+        metadata += ",\"strokes_schema\":\"" +
+                    std::string(paint_stroke_recording::Schema) + "\"";
+        metadata += ",\"strokes_written\":false";
+        const auto strokes_output_path =
+            json_string_field(request, "strokes_output_path", "");
+        if (recorded_count > 0)
+        {
+            const std::wstring strokes_path = utf8_to_wstring(strokes_output_path);
+            if (!strokes_output_path.empty() && recorded_strokes_write_file(strokes_path))
+            {
+                metadata += ",\"strokes_written\":true";
+                metadata += ",\"strokes_path\":\"" +
+                            json_escape(strokes_output_path) + "\"";
+            }
+            else if (!strokes_output_path.empty())
+            {
+                metadata += ",\"strokes_path\":\"" +
+                            json_escape(strokes_output_path) + "\"";
+                metadata += ",\"strokes_write_failure\":true";
+            }
+        }
         return response_json(true,
                              "export_paint_texture",
                              0,
@@ -29754,6 +30554,34 @@ namespace
                 complete_queued_paint_job(job, response);
                 continue;
             }
+            if (is_start_stroke_recording_request(job->request))
+            {
+                mark_queued_paint_job_dispatched(job);
+                const auto response = start_stroke_recording_on_game_thread(job->request);
+                complete_queued_paint_job(job, response);
+                continue;
+            }
+            if (is_stop_stroke_recording_request(job->request))
+            {
+                mark_queued_paint_job_dispatched(job);
+                const auto response = stop_stroke_recording_on_game_thread();
+                complete_queued_paint_job(job, response);
+                continue;
+            }
+            if (is_clear_stroke_recording_request(job->request))
+            {
+                mark_queued_paint_job_dispatched(job);
+                const auto response = clear_stroke_recording_on_game_thread();
+                complete_queued_paint_job(job, response);
+                continue;
+            }
+            if (is_export_strokes_request(job->request))
+            {
+                mark_queued_paint_job_dispatched(job);
+                const auto response = export_strokes_on_game_thread(job->request);
+                complete_queued_paint_job(job, response);
+                continue;
+            }
             if (is_import_paint_texture_request(job->request))
             {
                 mark_queued_paint_job_dispatched(job);
@@ -29788,7 +30616,8 @@ namespace
                 complete_queued_paint_job(job, response);
                 continue;
             }
-            if (is_replay_paint_texture_request(job->request))
+            if (is_replay_recorded_strokes_request(job->request) ||
+                is_replay_paint_texture_request(job->request))
             {
                 start_mesh_first_paint_async_job(job->request, job);
                 continue;
@@ -30037,6 +30866,17 @@ namespace
                 const auto function_address = reinterpret_cast<std::uintptr_t>(function);
                 const auto params_bytes = reinterpret_cast<std::uint8_t*>(params);
                 auto_event_watch_record(reinterpret_cast<std::uintptr_t>(object), function_address, params_bytes);
+                if (g_recorded_strokes_active.load(std::memory_order_acquire) &&
+                    function_address == g_recorded_strokes_function.load(std::memory_order_acquire) &&
+                    reinterpret_cast<std::uintptr_t>(object) ==
+                        g_recorded_strokes_component.load(std::memory_order_acquire) &&
+                    safe_read<int>(function_address + OffPropertiesSize, 0) ==
+                        static_cast<int>(sizeof(sdk::RuntimePaintableComponent_PaintAtUVWithBrush)))
+                {
+                    recorded_strokes_capture(
+                        *reinterpret_cast<const sdk::RuntimePaintableComponent_PaintAtUVWithBrush*>(
+                            params_bytes));
+                }
                 if (function_address == g_observed_sync_channel_function.load())
                 {
                     const auto channel = *reinterpret_cast<std::uint8_t*>(params_bytes);
@@ -36702,6 +37542,11 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         g_esp_native_snapshot_ready.store(false, std::memory_order_release);
         g_esp_native_hud_rebind_pending.store(false, std::memory_order_release);
         g_esp_native_probe_frames_remaining.store(0, std::memory_order_release);
+        // Stop appending immediately. The recorded vector is retained only for
+        // this process lifetime and is re-initialized by the next injection.
+        g_recorded_strokes_active.store(false, std::memory_order_release);
+        g_recorded_strokes_suppress.store(0, std::memory_order_release);
+        g_recorded_strokes_hook_owned.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> config_lock(g_esp_native_config_mutex);
             g_esp_native_config_signature.clear();
@@ -36821,7 +37666,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         }
         if (line.find("\"type\":\"capabilities\"") != std::string::npos)
         {
-            std::string commands = "[\"ping\",\"capabilities\",\"esp_native_present\",\"esp_native_present_status\",\"esp_native_present_probe\",\"appearance_present_probe\",\"appearance_emission_isolation_probe\",\"appearance_preview_emissive_override\",\"paint_full_route\",\"image_guide\",\"import_paint_texture\",\"export_paint_texture\",\"replay_paint_texture\",\"cancel_paint\",\"detach\",\"shutdown\"]";
+            std::string commands = "[\"ping\",\"capabilities\",\"esp_native_present\",\"esp_native_present_status\",\"esp_native_present_probe\",\"appearance_present_probe\",\"appearance_emission_isolation_probe\",\"appearance_preview_emissive_override\",\"paint_full_route\",\"image_guide\",\"import_paint_texture\",\"export_paint_texture\",\"replay_paint_texture\",\"start_stroke_recording\",\"stop_stroke_recording\",\"clear_stroke_recording\",\"export_strokes\",\"replay_recorded_strokes\",\"stroke_recording_status\",\"cancel_paint\",\"detach\",\"shutdown\"]";
             return std::string("{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,") +
                    "\"message\":\"ok\",\"timing_ms\":{}," +
                    "\"metadata\":{\"commands\":" + commands + "," +
@@ -36834,7 +37679,19 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
                    "\"local_paint_used\":true," +
                    "\"paint_at_uv_with_brush_used\":true," +
                    "\"replication\":\"game_recorded_strokes\"," +
+                   "\"stroke_recording\":\"process_event_detour_full_history\"," +
                    "\"multiplayer_replicated\":true}}\n";
+        }
+        if (request_type == "stroke_recording_status")
+        {
+            return response_json(true,
+                                 "stroke_recording_status",
+                                 0,
+                                 0,
+                                 g_recorded_strokes_active.load(std::memory_order_acquire)
+                                     ? "stroke recording is active"
+                                     : "stroke recording is idle",
+                                 recorded_stroke_metadata("stroke_recording_status"));
         }
         if (line.find("\"type\":\"cancel_paint\"") != std::string::npos)
         {
@@ -36961,7 +37818,12 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         }
         if (line.find("\"type\":\"import_paint_texture\"") != std::string::npos ||
             line.find("\"type\":\"export_paint_texture\"") != std::string::npos ||
-            line.find("\"type\":\"replay_paint_texture\"") != std::string::npos)
+            line.find("\"type\":\"replay_paint_texture\"") != std::string::npos ||
+            line.find("\"type\":\"start_stroke_recording\"") != std::string::npos ||
+            line.find("\"type\":\"stop_stroke_recording\"") != std::string::npos ||
+            line.find("\"type\":\"clear_stroke_recording\"") != std::string::npos ||
+            line.find("\"type\":\"export_strokes\"") != std::string::npos ||
+            line.find("\"type\":\"replay_recorded_strokes\"") != std::string::npos)
         {
             return paint_full_route_native(line);
         }

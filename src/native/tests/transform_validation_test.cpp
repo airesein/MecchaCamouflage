@@ -1,6 +1,7 @@
 #include "../include/sdk.hpp"
 #include "../include/runtime_contract.hpp"
 #include "../include/direct_bridge_abi.hpp"
+#include "../include/paint_stroke_recording.hpp"
 #include "../include/paint_texture_replay.hpp"
 
 #include <algorithm>
@@ -21,6 +22,91 @@ namespace
 
 int main()
 {
+    {
+        // Recorded paint strokes must serialise the raw PaintAtUVWithBrush
+        // parameters and parse back without colour-space or lossy conversion.
+        std::vector<sdk::FPaintStroke> strokes(2);
+        sdk::FPaintStroke first{};
+        first.Uv = {0.123456789, 0.987654321};
+        first.TargetChannel = sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive;
+        first.BrushSettings.Radius = 0.0123456f;
+        first.BrushSettings.Hardness = 0.77f;
+        first.BrushSettings.Opacity = 0.5f;
+        first.BrushSettings.Spacing = 0.25f;
+        first.BrushSettings.Falloff = sdk::EBrushFalloff::Smooth;
+        first.BrushSettings.BlendMode = sdk::EPaintBlendMode::Multiply;
+        first.BrushSettings.Rotation = 0.123f;
+        first.BrushSettings.BrushTexture = reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234));
+        first.ChannelData.AlbedoColor = {128.0f / 255.0f, 0.2509804f, 0.7529412f, 1.0f};
+        first.ChannelData.Metallic = 0.3f;
+        first.ChannelData.Roughness = 0.65f;
+        first.ChannelData.Height = 0.1f;
+        first.ChannelData.EmissiveColor = 0.2f;
+        first.ChannelData.ApplyMode = sdk::EPaintChannelApplyMode::AlphaBlend;
+        strokes[0] = first;
+        sdk::FPaintStroke second{};
+        second.Uv = {0.5, 0.5};
+        second.TargetChannel = sdk::EPaintChannel::Albedo;
+        second.BrushSettings.Radius = 0.02f;
+        second.ChannelData.AlbedoColor = {1.0f, 0.0f, 0.0f, 1.0f};
+        strokes[1] = second;
+
+        const auto json = paint_stroke_recording::serialize(
+            strokes,
+            "unit_test_recording",
+            3,
+            [](std::uintptr_t) { return std::string("Brush.Tip"); });
+        auto parsed = paint_stroke_recording::parse(
+            json,
+            [](const std::string&) { return static_cast<std::uintptr_t>(0); },
+            static_cast<std::uintptr_t>(0xABCD));
+        if (!parsed.ok || parsed.count != 2 || parsed.declared_count != 2 ||
+            parsed.dropped != 3 || parsed.source != "unit_test_recording")
+        {
+            return 194;
+        }
+        const auto& round_trip = parsed.strokes[0];
+        if (std::abs(round_trip.Uv.X - first.Uv.X) > 1e-12 ||
+            std::abs(round_trip.Uv.Y - first.Uv.Y) > 1e-12 ||
+            std::abs(round_trip.BrushSettings.Radius - first.BrushSettings.Radius) > 1e-7f ||
+            std::abs(round_trip.BrushSettings.Hardness - first.BrushSettings.Hardness) > 1e-7f ||
+            round_trip.BrushSettings.Falloff != first.BrushSettings.Falloff ||
+            round_trip.BrushSettings.BlendMode != first.BrushSettings.BlendMode ||
+            std::abs(round_trip.ChannelData.AlbedoColor.R -
+                     first.ChannelData.AlbedoColor.R) > 1e-7f ||
+            std::abs(round_trip.ChannelData.AlbedoColor.G -
+                     first.ChannelData.AlbedoColor.G) > 1e-7f ||
+            std::abs(round_trip.ChannelData.AlbedoColor.B -
+                     first.ChannelData.AlbedoColor.B) > 1e-7f ||
+            std::abs(round_trip.ChannelData.Metallic - first.ChannelData.Metallic) > 1e-7f ||
+            std::abs(round_trip.ChannelData.Roughness - first.ChannelData.Roughness) > 1e-7f ||
+            std::abs(round_trip.ChannelData.Height - first.ChannelData.Height) > 1e-7f ||
+            std::abs(round_trip.ChannelData.EmissiveColor -
+                     first.ChannelData.EmissiveColor) > 1e-7f ||
+            round_trip.ChannelData.ApplyMode != first.ChannelData.ApplyMode ||
+            round_trip.TargetChannel != first.TargetChannel ||
+            reinterpret_cast<std::uintptr_t>(round_trip.BrushSettings.BrushTexture) !=
+                static_cast<std::uintptr_t>(0xABCD))
+        {
+            return 195;
+        }
+        auto unsupported_schema = json;
+        const std::string schema{paint_stroke_recording::Schema};
+        const auto schema_pos = unsupported_schema.find(schema);
+        if (schema_pos == std::string::npos)
+        {
+            return 196;
+        }
+        unsupported_schema.replace(schema_pos, schema.size(), "meccha_paint_strokes_unknown");
+        if (paint_stroke_recording::parse(
+                unsupported_schema,
+                [](const std::string&) { return static_cast<std::uintptr_t>(0); },
+                0)
+                .ok)
+        {
+            return 197;
+        }
+    }
     {
         constexpr int size = 64;
         constexpr float radius = 4.0f / size;

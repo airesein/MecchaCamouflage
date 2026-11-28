@@ -1159,6 +1159,14 @@ public sealed class MainForm : Form
                 return HandleSaveImagePreset(command.Payload);
             case "exportCurrentPaint":
                 return await HandleExportCurrentPaintAsync();
+            case "startPaintRecording":
+                return RecordingStatusPayload(await HandleStartPaintRecordingAsync(command.Payload));
+            case "stopPaintRecording":
+                return RecordingStatusPayload(await session.StopStrokeRecordingAsync());
+            case "clearPaintRecording":
+                return RecordingStatusPayload(await session.ClearStrokeRecordingAsync());
+            case "paintRecordingStatus":
+                return RecordingStatusPayload(await session.GetStrokeRecordingStatusAsync());
             case "reusePaintStart":
                 return ApplyPaintResult(await HandleReusePaintStartAsync(command.Payload));
             case "reusePaintStop":
@@ -1271,9 +1279,29 @@ public sealed class MainForm : Form
             manifestPath = result.ManifestPath,
             albedoPng = result.AlbedoPng,
             pbrPng = result.PbrPng,
-            textureSize = result.TextureSize
+            textureSize = result.TextureSize,
+            strokeCount = result.StrokeCount,
+            strokeSource = result.StrokeSource
         };
     }
+
+    private async Task<PaintStrokeRecordingStatus> HandleStartPaintRecordingAsync(JsonElement payload)
+    {
+        var restart = payload.TryGetProperty("restart", out var restartValue) &&
+                      restartValue.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                      restartValue.GetBoolean();
+        return await session.StartStrokeRecordingAsync(restart);
+    }
+
+    private static object RecordingStatusPayload(PaintStrokeRecordingStatus status) => new
+    {
+        success = status.Success,
+        message = status.Message,
+        active = status.Active,
+        strokeCount = status.StrokeCount,
+        strokeSource = status.Source,
+        dropped = status.Dropped
+    };
 
     private static bool TryReadPaintExportPath(JsonElement payload, out string manifestPath, out string message)
     {

@@ -102,6 +102,12 @@ var tests = new List<(string Name, Action Run)>
     ("legacy image transforms migrate to individual layers", LegacyImageTransformsMigrateToIndividualLayers),
     ("image preset round-trips an uncompressed container", ImagePresetRoundTripsUncompressedContainer),
     ("paint texture archive normalizes manifest texture names", PaintTextureArchiveNormalizesManifest),
+    ("paint stroke recording round-trips raw brush data", PaintStrokeRecordingRoundTripsRawData),
+    ("reuse paint prefers recorded strokes without texture resampling", ReusePaintUsesRecordedStrokes),
+    ("paint stroke archive compatibility keeps the texture fallback", PaintStrokeArchiveKeepsTextureFallback),
+    ("native stroke recording guards replay recursion", NativeStrokeRecordingGuardsReplay),
+    ("web ui exposes paint stroke recording controls", WebUiExposesPaintStrokeRecording),
+    ("paint stroke recording strings exist in every locale", PaintStrokeRecordingStringsExistInEveryLocale),
     ("reuse paint start previews and stops through direct UV replay", ReusePaintRequestsDirectUvReplay),
     ("native replay samples saved raw textures through the Image Paint mesh surface plan", NativeReplaySamplesMeshSurfacePlan),
     ("v1 image preset expands global transforms to layers", V1ImagePresetExpandsGlobalTransformsToLayers),
@@ -5832,6 +5838,277 @@ static void DevelopmentBuildsUseIsolatedVersionScopes()
     File.WriteAllText(Path.Combine(first.ImagePresetsDirectory, "marker"), "first build");
     Assert(!File.Exists(Path.Combine(second.ImagePresetsDirectory, "marker")),
         "distinct build identities must not share Image preset storage");
+}
+
+static void PaintStrokeRecordingRoundTripsRawData()
+{
+    var sample = new PaintStrokeSample(
+        U: 0.123456789,
+        V: 0.987654321,
+        Channel: 7,
+        Radius: 0.0123456,
+        Hardness: 0.77,
+        Opacity: 0.5,
+        Spacing: 0.25,
+        Falloff: 1,
+        BlendMode: 2,
+        Rotation: 0.125,
+        BrushTexturePath: "Brush.Tip",
+        AlbedoR: 128.0 / 255.0,
+        AlbedoG: 0.2509804,
+        AlbedoB: 0.7529412,
+        AlbedoA: 1.0,
+        Metallic: 0.3,
+        Roughness: 0.65,
+        Height: 0.1,
+        Emissive: 0.2,
+        ApplyMode: 1);
+    var json = PaintStrokeFile.Serialize([sample], "unit_test_recording", 2);
+    Assert(PaintStrokeFile.TryParse(json, out var strokes, out var summary, out var message), message);
+    Assert(summary.Count == 1 && summary.Source == "unit_test_recording" && summary.Dropped == 2,
+        "the strokes summary must preserve count, source, and dropped values");
+    Assert(strokes.Count == 1, "the strokes file must round-trip one stroke");
+    var parsed = strokes[0];
+    Assert(Math.Abs(parsed.U - sample.U) < 1e-12 &&
+           Math.Abs(parsed.V - sample.V) < 1e-12 &&
+           Math.Abs(parsed.Radius - sample.Radius) < 1e-12 &&
+           Math.Abs(parsed.Hardness - sample.Hardness) < 1e-12 &&
+           Math.Abs(parsed.Opacity - sample.Opacity) < 1e-12 &&
+           Math.Abs(parsed.Spacing - sample.Spacing) < 1e-12 &&
+           Math.Abs(parsed.Rotation - sample.Rotation) < 1e-12 &&
+           parsed.Channel == sample.Channel &&
+           parsed.Falloff == sample.Falloff &&
+           parsed.BlendMode == sample.BlendMode &&
+           parsed.ApplyMode == sample.ApplyMode &&
+           Math.Abs(parsed.AlbedoR - sample.AlbedoR) < 1e-12 &&
+           Math.Abs(parsed.AlbedoG - sample.AlbedoG) < 1e-12 &&
+           Math.Abs(parsed.AlbedoB - sample.AlbedoB) < 1e-12 &&
+           Math.Abs(parsed.AlbedoA - sample.AlbedoA) < 1e-12 &&
+           Math.Abs(parsed.Metallic - sample.Metallic) < 1e-12 &&
+           Math.Abs(parsed.Roughness - sample.Roughness) < 1e-12 &&
+           Math.Abs(parsed.Height - sample.Height) < 1e-12 &&
+           Math.Abs(parsed.Emissive - sample.Emissive) < 1e-12 &&
+           parsed.BrushTexturePath == sample.BrushTexturePath,
+        "raw stroke values must survive serialization without colour-space conversion");
+    Assert(!json.Contains("sRGB", StringComparison.OrdinalIgnoreCase) &&
+           !json.Contains("compressed", StringComparison.OrdinalIgnoreCase),
+        "the recorded stroke container must not imply a colour or compression transform");
+}
+
+static void ReusePaintUsesRecordedStrokes()
+{
+    var root = FindRepositoryRoot();
+    var host = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+    var native = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
+    var header = ReadRepositoryText(Path.Combine(
+        root, "src", "native", "include", "paint_stroke_recording.hpp"));
+
+    var startMethod = host.IndexOf(
+        "public async Task<PaintTextureReuseResult> StartReusePaintAsync",
+        StringComparison.Ordinal);
+    var stopPreviewMethod = host.IndexOf(
+        "public async Task<HostCommandResult> StopReusePaintPreviewAsync",
+        StringComparison.Ordinal);
+    Assert(startMethod >= 0 && stopPreviewMethod > startMethod,
+        "Reuse Paint start must remain discoverable");
+    var start = host[startMethod..stopPreviewMethod];
+    Assert(start.Contains("source.StrokesPath", StringComparison.Ordinal) &&
+           start.Contains("source.StrokeCount > 0", StringComparison.Ordinal) &&
+           start.Contains("ReplayRecordedStrokesAsync(", StringComparison.Ordinal),
+        "Reuse Paint must replay recorded strokes when the archive contains them");
+    Assert(start.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
+        "Reuse Paint must retain the texture replay strategy as a fallback");
+
+    var exactStart = host.IndexOf(
+        "public async Task<PaintTextureReplayResult> ReplayRecordedStrokesAsync",
+        StringComparison.Ordinal);
+    var textureStart = host.IndexOf(
+        "public async Task<PaintTextureReplayResult> ReplayPaintTextureAsync",
+        exactStart,
+        StringComparison.Ordinal);
+    Assert(exactStart >= 0 && textureStart > exactStart,
+        "the exact recorded-stroke replay method must remain discoverable");
+    var exact = host[exactStart..textureStart];
+    Assert(exact.Contains("type = \"replay_recorded_strokes\"", StringComparison.Ordinal) &&
+           exact.Contains("strokes_path = strokesPath", StringComparison.Ordinal) &&
+           !exact.Contains("import_paint_texture", StringComparison.Ordinal),
+        "exact replay must send the raw strokes file instead of importing a texture");
+    Assert(exact.Contains("UsedRecordedStrokes", StringComparison.Ordinal) ||
+           exact.Contains(", true)", StringComparison.Ordinal),
+        "exact replay results must be flagged as recorded-stroke replay");
+
+    Assert(native.Contains("replay_texture_resampling\\\":false", StringComparison.Ordinal) &&
+           native.Contains("replay_color_conversion\\\":false", StringComparison.Ordinal) &&
+           native.Contains("replay_compression\\\":false", StringComparison.Ordinal) &&
+           native.Contains("exact_stroke_replay\\\":true", StringComparison.Ordinal),
+        "native exact replay must explicitly disable resampling, colour conversion, and compression");
+    Assert(native.Contains("replay_recorded_strokes_on_game_thread", StringComparison.Ordinal) &&
+           native.Contains("paint_stroke_recording::parse", StringComparison.Ordinal),
+        "native must parse recorded strokes and feed the existing PaintAtUVWithBrush job");
+    Assert(header.Contains("meccha_paint_strokes_v1", StringComparison.Ordinal) &&
+           header.Contains("albedo_r", StringComparison.Ordinal) &&
+           header.Contains("brush_texture_path", StringComparison.Ordinal),
+        "the native stroke schema must carry raw channel values and brush identity");
+}
+
+static void PaintStrokeArchiveKeepsTextureFallback()
+{
+    var root = Path.Combine(Path.GetTempPath(), "meccha-stroke-archive-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        Directory.CreateDirectory(root);
+        var albedoRgba = Path.Combine(root, "albedo.rgba");
+        var pbrRgba = Path.Combine(root, "pbr.rgba");
+        var albedoPng = Path.Combine(root, "albedo.png");
+        var pbrPng = Path.Combine(root, "pbr.png");
+        File.WriteAllBytes(albedoRgba, [1, 2, 3, 4]);
+        File.WriteAllBytes(pbrRgba, [5, 6, 7, 8]);
+        File.WriteAllBytes(albedoPng, [9]);
+        File.WriteAllBytes(pbrPng, [10]);
+        var strokesJson = Path.Combine(root, PaintStrokeFile.FileName);
+        File.WriteAllText(strokesJson, PaintStrokeFile.Serialize(
+            [new PaintStrokeSample(0.1, 0.2, 7, 0.01, 1, 1, 0.25, 2, 0, 0, "", 1, 0, 0, 1, 0, 0.65, 0, 0, 0)],
+            "archive_test"));
+        var manifest = Path.Combine(root, "manifest.json");
+        File.WriteAllText(manifest, JsonSerializer.Serialize(new
+        {
+            schema = "meccha_paint_texture_export_v1",
+            texture_size = 1,
+            albedo_rgba = "albedo.rgba",
+            pbr_rgba = "pbr.rgba",
+            albedo_png = "albedo.png",
+            pbr_png = "pbr.png",
+            stroke_count = 1,
+            stroke_source = "archive_test",
+            strokes_file = PaintStrokeFile.FileName
+        }));
+
+        var withStrokes = Path.Combine(root, "with-strokes.mcpaint");
+        PaintTextureArchive.Write(withStrokes, manifest, albedoRgba, pbrRgba, albedoPng, pbrPng, strokesJson);
+        var extracted = Path.Combine(root, "extracted");
+        PaintTextureArchive.Extract(withStrokes, extracted);
+        Assert(File.Exists(Path.Combine(extracted, PaintStrokeFile.FileName)),
+            "archives created with strokes must contain strokes.json");
+        Assert(PaintStrokeFile.TryReadSummary(
+                Path.Combine(extracted, PaintStrokeFile.FileName),
+                out var summary,
+                out var summaryMessage) &&
+               summary.Count == 1 &&
+               summary.Source == "archive_test",
+            "the archived strokes summary must be readable: " + summaryMessage);
+        using (var manifestDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(extracted, "manifest.json"))))
+        {
+            Assert(manifestDocument.RootElement.TryGetProperty("strokes_file", out var strokesFile) &&
+                   strokesFile.GetString() == PaintStrokeFile.FileName,
+                "archive normalization must preserve the strokes file reference");
+        }
+
+        var legacy = Path.Combine(root, "legacy.mcpaint");
+        PaintTextureArchive.Write(legacy, manifest, albedoRgba, pbrRgba, albedoPng, pbrPng);
+        var legacyExtracted = Path.Combine(root, "legacy-extracted");
+        PaintTextureArchive.Extract(legacy, legacyExtracted);
+        Assert(!File.Exists(Path.Combine(legacyExtracted, PaintStrokeFile.FileName)),
+            "an archive written without strokes must remain texture-only");
+
+        var repositoryRoot = FindRepositoryRoot();
+        var host = ReadRepositoryText(Path.Combine(
+            repositoryRoot,
+            "src", "csharp", "MecchaCamouflage.Controller", "HostSession.cs"));
+        Assert(host.Contains("TryReadPaintStrokesManifest", StringComparison.Ordinal) &&
+               host.Contains("strokes_file", StringComparison.Ordinal) &&
+               host.Contains("ReplayPaintTextureAsync(", StringComparison.Ordinal),
+            "old texture-only archives must continue through the texture replay fallback");
+    }
+    finally
+    {
+        try { Directory.Delete(root, true); } catch { }
+    }
+}
+
+static void NativeStrokeRecordingGuardsReplay()
+{
+    var root = FindRepositoryRoot();
+    var bridge = ReadRepositoryText(Path.Combine(root, "src", "native", "bridge", "bridge.cpp"));
+
+    Assert(bridge.Contains("start_stroke_recording_on_game_thread", StringComparison.Ordinal) &&
+           bridge.Contains("stop_stroke_recording_on_game_thread", StringComparison.Ordinal) &&
+           bridge.Contains("clear_stroke_recording_on_game_thread", StringComparison.Ordinal) &&
+           bridge.Contains("export_strokes_on_game_thread", StringComparison.Ordinal) &&
+           bridge.Contains("replay_recorded_strokes_on_game_thread", StringComparison.Ordinal),
+        "native must expose start/stop/clear/export/replay recording commands");
+    Assert(bridge.Contains("recorded_strokes_capture(params)", StringComparison.Ordinal) &&
+           bridge.Contains("allow_recording", StringComparison.Ordinal) &&
+           bridge.Contains("g_recorded_strokes_suppress", StringComparison.Ordinal),
+        "the app's own paint must be recordable while replay is suppressed");
+    Assert(bridge.Contains("suppress_stroke_recording = true", StringComparison.Ordinal) &&
+           bridge.Contains("!job->suppress_stroke_recording", StringComparison.Ordinal),
+        "replay jobs must never append their own PaintAtUVWithBrush calls to the recording");
+    Assert(bridge.Contains("function_address == g_recorded_strokes_function.load", StringComparison.Ordinal) &&
+           bridge.Contains("g_recorded_strokes_component.load", StringComparison.Ordinal),
+        "the ProcessEvent detour must filter to the local component and PaintAtUVWithBrush");
+    Assert(bridge.Contains("is_replay_recorded_strokes_request", StringComparison.Ordinal) &&
+           bridge.Contains("start_mesh_first_paint_async_job(job->request, job)", StringComparison.Ordinal),
+        "recorded-stroke replay must reuse the existing async paint dispatcher");
+}
+
+static void WebUiExposesPaintStrokeRecording()
+{
+    var root = FindRepositoryRoot();
+    var markup = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.WebHost", "web", "index.html"));
+    var app = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.WebHost", "web", "app.js"));
+    var form = ReadRepositoryText(Path.Combine(
+        root, "src", "csharp", "MecchaCamouflage.WebHost", "MainForm.cs"));
+
+    Assert(markup.Contains("data-paint-recording-command=\"start\"", StringComparison.Ordinal) &&
+           markup.Contains("data-paint-recording-command=\"stop\"", StringComparison.Ordinal) &&
+           markup.Contains("data-paint-recording-command=\"clear\"", StringComparison.Ordinal) &&
+           markup.Contains("id=\"image-record-status\"", StringComparison.Ordinal) &&
+           markup.Contains("data-i18n=\"recording.title\"", StringComparison.Ordinal),
+        "the Image tab must expose Record, Stop Recording, Clear, and a stroke-count status");
+    Assert(app.Contains("function runPaintRecordingCommand", StringComparison.Ordinal) &&
+           app.Contains("send(\"startPaintRecording\"", StringComparison.Ordinal) &&
+           app.Contains("send(\"stopPaintRecording\"", StringComparison.Ordinal) &&
+           app.Contains("send(\"clearPaintRecording\"", StringComparison.Ordinal) &&
+           app.Contains("send(\"paintRecordingStatus\"", StringComparison.Ordinal) &&
+           app.Contains("function refreshPaintRecordingStatus", StringComparison.Ordinal) &&
+           app.Contains("recording.active", StringComparison.Ordinal),
+        "the web UI must start/stop/clear recording and poll the live stroke count");
+    Assert(form.Contains("case \"startPaintRecording\"", StringComparison.Ordinal) &&
+           form.Contains("case \"stopPaintRecording\"", StringComparison.Ordinal) &&
+           form.Contains("case \"clearPaintRecording\"", StringComparison.Ordinal) &&
+           form.Contains("case \"paintRecordingStatus\"", StringComparison.Ordinal) &&
+           form.Contains("StopStrokeRecordingAsync", StringComparison.Ordinal) &&
+           form.Contains("RecordingStatusPayload", StringComparison.Ordinal),
+        "the host must dispatch all recording commands and report status");
+    Assert(markup.Contains("data-reuse-paint-command=\"start\"", StringComparison.Ordinal) &&
+           markup.Contains("data-reuse-paint-command=\"stop\"", StringComparison.Ordinal) &&
+           markup.Contains("data-reuse-paint-command=\"preview\"", StringComparison.Ordinal) &&
+           markup.Contains("data-reuse-paint-command=\"stopPreview\"", StringComparison.Ordinal) &&
+           app.Contains("start.disabled = !hasPath || running", StringComparison.Ordinal) &&
+           app.Contains("preview.disabled = !hasPath || running", StringComparison.Ordinal),
+        "the existing Reuse Paint Start/Stop/Preview/Stop Preview and path enablement must not regress");
+}
+
+static void PaintStrokeRecordingStringsExistInEveryLocale()
+{
+    var catalog = LocalizationCatalog.Load();
+    var keys = new[]
+    {
+        "recording.title", "recording.idle", "recording.active", "recording.stopped",
+        "button.record.stop", "button.record.clear",
+        "toast.recording.started", "toast.recording.stopped", "toast.recording.cleared"
+    };
+    foreach (var locale in LocalizationCatalog.SupportedLocales)
+    {
+        foreach (var key in keys)
+        {
+            Assert(!string.Equals(catalog.Text(locale.Code, key), key, StringComparison.Ordinal),
+                $"{locale.Code} must translate {key}");
+        }
+    }
 }
 
 static void ReusePaintRequestsDirectUvReplay()

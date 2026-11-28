@@ -142,6 +142,11 @@
                     <button id="image-reuse-stop" class="image-transfer-control danger-action" type="button" data-reuse-paint-command="stop" data-i18n="button.stop" disabled>Stop</button>
                     <button id="image-reuse-preview" class="image-transfer-control" type="button" data-reuse-paint-command="preview" data-i18n="button.preview" disabled>Preview</button>
                     <button id="image-reuse-stop-preview" class="image-transfer-control" type="button" data-reuse-paint-command="stopPreview" data-i18n="button.stop.preview" disabled>Stop Preview</button>
+                    <div class="manual-paint-label" data-i18n="recording.title">Record strokes</div>
+                    <button id="image-record-start" class="image-transfer-control" type="button" data-paint-recording-command="start" data-i18n="button.record" disabled>Record</button>
+                    <button id="image-record-stop" class="image-transfer-control danger-action" type="button" data-paint-recording-command="stop" data-i18n="button.record.stop" disabled>Stop Recording</button>
+                    <button id="image-record-clear" class="image-transfer-control" type="button" data-paint-recording-command="clear" data-i18n="button.record.clear" disabled>Clear Recording</button>
+                    <span id="image-record-status" class="record-status" aria-live="polite">Not recording</span>
                   </div>
                   <div class="image-choice-list">
                     <span class="field-label" title="Changes the game surface mapping; it does not move the image in the atlas." data-i18n="image.body.type" data-i18n-title="aria.image.body.type">Body type</span><div class="region-choice image-choice" role="group" aria-label="Body type" data-i18n-aria-label="aria.image.body.type">
