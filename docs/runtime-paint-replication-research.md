@@ -32,9 +32,11 @@ the live mesh profile, the RuntimePaintable triangle cache, and the Image Paint
 sample density (the Image brush size) produce the mesh samples. It does not use
 the 4-face image or the canonical atlas. Each mesh sample's UV indexes the saved
 raw albedo/PBR texture directly (no `v` flip) with edge-clamped bilinear
-sampling. Replay never skips samples by alpha and never applies color
-compression. Strokes use `sRGB -> linear` albedo and channel 7 through
-`PaintAtUVWithBrush`.
+sampling. Replay uses the raw albedo and PBR values also used by Preview and
+stamps them with a solid brush through `PaintAtUVWithBrush` on channel 7.
+It can merge neighboring strokes when an enlarged brush covers their original
+footprints and the surrounding albedo and PBR texels have identical values.
+The response reports the number of saved submissions in `replay_strokes_merged`.
 
 Preview locally imports the archive and preserves the pre-preview material
 snapshot through the existing Preview/Unpreview mechanism. Stop Preview restores

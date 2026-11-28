@@ -5987,14 +5987,18 @@ static void NativeReplaySamplesMeshSurfacePlan()
     Assert(!body.Contains("albedo.bytes[offset + 3U]", StringComparison.Ordinal) &&
            body.Contains("alpha_skipping", StringComparison.Ordinal),
         "replay must not drop mesh samples based on the paint texture alpha");
-    Assert(body.Contains("sample_raw_texture(", StringComparison.Ordinal) &&
-           body.Contains("albedo.bytes, texture_size, sample.u, sample.v", StringComparison.Ordinal) &&
-           body.Contains("packed_pbr.bytes, texture_size, sample.u, sample.v", StringComparison.Ordinal) &&
+    Assert(body.Contains("paint_texture_replay::Texture{texture_size, albedo.bytes, packed_pbr.bytes}", StringComparison.Ordinal) &&
+           body.Contains("texture.sample(sample.u, sample.v)", StringComparison.Ordinal) &&
            !body.Contains("texture_size_denominator", StringComparison.Ordinal) &&
            !body.Contains("grid_width", StringComparison.Ordinal),
         "replay must sample albedo and packed PBR at each mesh sample UV instead of a texture grid");
-    Assert(body.Contains("runtime_contract::appearance_srgb_to_linear(albedo_sample[0])", StringComparison.Ordinal),
-        "replay must convert sRGB albedo to linear values");
+    Assert(!body.Contains("appearance_srgb_to_linear", StringComparison.Ordinal),
+        "replay must preserve the raw albedo values used by Preview");
+    Assert(body.Contains("sdk::FRuntimeBrushSettings brush{}", StringComparison.Ordinal) &&
+           !body.Contains("RuntimePaintable_CurrentBrushSettings", StringComparison.Ordinal),
+        "replay must use a solid brush so an active brush texture cannot alter the saved color");
+    Assert(body.Contains("paint_texture_replay::plan_brush_radii", StringComparison.Ordinal),
+        "replay must use coverage-checked brush radii for uniform texture areas");
     Assert(body.Contains("sdk_make_uv_stroke(", StringComparison.Ordinal) &&
            body.Contains("sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive", StringComparison.Ordinal),
         "replay must build channel-7 UV strokes");

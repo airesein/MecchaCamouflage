@@ -1,6 +1,7 @@
 #include "../include/sdk.hpp"
 #include "../include/runtime_contract.hpp"
 #include "../include/direct_bridge_abi.hpp"
+#include "../include/paint_texture_replay.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,55 @@ namespace
 
 int main()
 {
+    {
+        constexpr int size = 64;
+        constexpr float radius = 4.0f / size;
+        std::vector<std::uint8_t> albedo(size * size * 4, 128);
+        std::vector<std::uint8_t> pbr(size * size * 4, 64);
+        const paint_texture_replay::Texture texture{size, albedo, pbr};
+        struct Sample { double u; double v; };
+        const std::vector<Sample> samples{
+            {0.53, 0.53}, {0.59, 0.53}, {0.53, 0.59}, {0.59, 0.59},
+            {0.01, 0.01}, {0.06, 0.06}};
+        const auto channels = texture.sample(0.53, 0.59);
+        if (std::abs(channels[0] - 128.0 / 255.0) > 0.000001 ||
+            std::abs(channels[3] - 64.0 / 255.0) > 0.000001)
+        {
+            return 180;
+        }
+        const auto radii = paint_texture_replay::plan_brush_radii(texture, samples, radius);
+        if (radii[0] < std::hypot(0.06, 0.06) + radius ||
+            radii[1] != 0.0f || radii[2] != 0.0f || radii[3] != 0.0f ||
+            radii[4] != radius || radii[5] != radius)
+        {
+            return 181;
+        }
+
+        // A material detail near the widened brush blocks merging even when
+        // the original sample centers all have the same color and material.
+        constexpr std::size_t detail = (47 * size + 33) * 4;
+        pbr[detail + 1] = 99;
+        if (paint_texture_replay::plan_brush_radii(texture, samples, radius) !=
+            std::vector<float>(samples.size(), radius))
+        {
+            return 182;
+        }
+        pbr[detail + 1] = 64;
+        albedo[detail + 2] = 220;
+        if (paint_texture_replay::plan_brush_radii(texture, samples, radius) !=
+            std::vector<float>(samples.size(), radius))
+        {
+            return 183;
+        }
+
+        const double u = 33.0 / (size - 1);
+        const double v = 46.5 / (size - 1);
+        const auto interpolated = texture.sample(u, v);
+        if (std::abs(interpolated[2] - (128.0 + 220.0) / (2.0 * 255.0)) > 0.000001)
+        {
+            return 184;
+        }
+    }
     BridgeStartBlockV2 bootstrap{};
     bootstrap.magic = BridgeStartMagicV2;
     bootstrap.size = sizeof(bootstrap);

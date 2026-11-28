@@ -46,6 +46,7 @@
 
 #include "../include/sdk.hpp"
 #include "../include/direct_bridge_abi.hpp"
+#include "../include/paint_texture_replay.hpp"
 #include "../include/runtime_contract.hpp"
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -24079,6 +24080,7 @@ namespace
     auto replay_paint_texture_on_game_thread(const std::string& request,
                                              const std::shared_ptr<QueuedPaintJob>& queued_job) -> std::string
     {
+        const auto total_preprocess_start = std::chrono::high_resolution_clock::now();
         paint_dispatch_set_debug_stage(PaintDispatchDebugStage::ParseRequest);
         if (queued_paint_cancel_reason(queued_job) != PaintCancelReason::None)
         {
@@ -24208,8 +24210,8 @@ namespace
                                      metadata + ",\"pbr_path\":\"" +
                                          json_escape(pbr_path) + "\"");
             }
-            albedo = {true, albedo_bytes, ""};
-            packed_pbr = {true, pbr_bytes, ""};
+            albedo = {true, std::move(albedo_bytes), ""};
+            packed_pbr = {true, std::move(pbr_bytes), ""};
             metadata += ",\"texture_source\":\"provided_raw_rgba\"";
             metadata += ",\"albedo_path\":\"" + json_escape(albedo_path) + "\"";
             metadata += ",\"pbr_path\":\"" + json_escape(pbr_path) + "\"";
@@ -24449,78 +24451,24 @@ namespace
             return queued_paint_cancel_response(queued_job, "mesh_paint_cancelled");
         }
 
-        sdk::FRuntimeBrushSettings base_brush{};
-        safe_copy(&base_brush,
-                  reinterpret_cast<const void*>(
-                      ctx.component +
-                      sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings),
-                  sizeof(base_brush));
-        base_brush.Hardness = 1.0f;
-        base_brush.Opacity = 1.0f;
-        base_brush.Spacing = 1.0f;
-        base_brush.Falloff = sdk::EBrushFalloff::Spherical;
-        base_brush.BlendMode = sdk::EPaintBlendMode::Normal;
-        sdk::FRuntimeBrushSettings brush = base_brush;
+        // The saved channels already contain the original brush pattern.
+        // Use a solid brush so the active in-game tip cannot stamp it again.
+        sdk::FRuntimeBrushSettings brush{};
+        brush.Spacing = 1.0f;
         const double brush_radius_uv =
             static_cast<double>(brush_size_texels) /
             static_cast<double>(std::max(1, active_texture_size));
         brush.Radius = static_cast<float>(brush_radius_uv);
         metadata += ",\"brush_radius_uv\":" + std::to_string(brush_radius_uv);
 
-        // Direct raw UV indexing with edge clamping and bilinear filtering. The
-        // saved texture uses the game texture's UV orientation, so v is not
-        // flipped. Alpha is sampled but never used to skip a mesh sample.
-        const auto sample_raw_texture =
-            [](const std::vector<std::uint8_t>& bytes,
-               int size,
-               double u,
-               double v,
-               std::array<double, 4>& out) {
-                out = {0.0, 0.0, 0.0, 1.0};
-                if (bytes.empty() || size <= 0)
-                {
-                    return;
-                }
-                const double max_coord =
-                    static_cast<double>(std::max(1, size - 1));
-                const double sample_x = clamp01(u) * max_coord;
-                const double sample_y = clamp01(v) * max_coord;
-                const double base_x = std::floor(sample_x);
-                const double base_y = std::floor(sample_y);
-                const int x0 = std::max(
-                    0, std::min(size - 1, static_cast<int>(base_x)));
-                const int y0 = std::max(
-                    0, std::min(size - 1, static_cast<int>(base_y)));
-                const int x1 = std::max(0, std::min(size - 1, x0 + 1));
-                const int y1 = std::max(0, std::min(size - 1, y0 + 1));
-                const double tx = sample_x - base_x;
-                const double ty = sample_y - base_y;
-                const auto texel = [&](int x, int y, int channel) {
-                    const std::size_t offset =
-                        (static_cast<std::size_t>(y) *
-                             static_cast<std::size_t>(size) +
-                         static_cast<std::size_t>(x)) *
-                            4U +
-                        static_cast<std::size_t>(channel);
-                    return offset < bytes.size()
-                               ? static_cast<double>(bytes[offset]) / 255.0
-                               : 0.0;
-                };
-                for (int channel = 0; channel < 4; ++channel)
-                {
-                    const double top =
-                        texel(x0, y0, channel) * (1.0 - tx) +
-                        texel(x1, y0, channel) * tx;
-                    const double bottom =
-                        texel(x0, y1, channel) * (1.0 - tx) +
-                        texel(x1, y1, channel) * tx;
-                    out[static_cast<std::size_t>(channel)] =
-                        top * (1.0 - ty) + bottom * ty;
-                }
-            };
+        const auto texture =
+            paint_texture_replay::Texture{texture_size, albedo.bytes, packed_pbr.bytes};
+        const auto brush_radii =
+            paint_texture_replay::plan_brush_radii(texture, plan_samples, brush.Radius);
 
         std::vector<sdk::FPaintStroke> strokes{};
         strokes.reserve(plan_samples.size());
+        std::size_t merged_strokes = 0;
         for (std::size_t sample_index = 0;
              sample_index < plan_samples.size();
              ++sample_index)
@@ -24535,28 +24483,29 @@ namespace
             {
                 continue;
             }
-            std::array<double, 4> albedo_sample{};
-            std::array<double, 4> pbr_sample{};
-            sample_raw_texture(
-                albedo.bytes, texture_size, sample.u, sample.v, albedo_sample);
-            sample_raw_texture(
-                packed_pbr.bytes, texture_size, sample.u, sample.v, pbr_sample);
+            const float stroke_radius = brush_radii[sample_index];
+            if (stroke_radius == 0.0f)
+            {
+                ++merged_strokes;
+                continue;
+            }
+            auto stroke_brush = brush;
+            stroke_brush.Radius = stroke_radius;
+            // Export and Preview use the game texture's raw channels and UVs.
+            const auto channels = texture.sample(sample.u, sample.v);
             const auto channel = sdk_make_channel(
-                runtime_contract::appearance_srgb_to_linear(albedo_sample[0]),
-                runtime_contract::appearance_srgb_to_linear(albedo_sample[1]),
-                runtime_contract::appearance_srgb_to_linear(albedo_sample[2]),
-                pbr_sample[0],
-                pbr_sample[1],
-                pbr_sample[2],
+                channels[0], channels[1], channels[2],
+                channels[3], channels[4], channels[5],
                 sdk::EPaintChannelApplyMode::Override);
             strokes.push_back(sdk_make_uv_stroke(
                 sample.u,
                 sample.v,
                 channel,
-                brush,
+                stroke_brush,
                 sdk::EPaintChannel::AlbedoMetallicRoughnessEmissive));
         }
         metadata += ",\"replay_strokes_total\":" + std::to_string(strokes.size());
+        metadata += ",\"replay_strokes_merged\":" + std::to_string(merged_strokes);
         metadata += ",\"replay_alpha_skipping\":false";
         metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
         metadata += ",\"local_route_mode\":\"native_recorded_paint\"";
@@ -24572,7 +24521,6 @@ namespace
                                  metadata);
         }
 
-        const auto total_preprocess_start = std::chrono::high_resolution_clock::now();
         auto async_job = std::make_shared<MeshFirstServerBatchAsyncJob>();
         async_job->queued = queued_job;
         async_job->controller = ctx.controller;
