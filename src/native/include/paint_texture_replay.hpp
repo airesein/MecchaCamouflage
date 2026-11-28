@@ -80,82 +80,105 @@ namespace paint_texture_replay
         }
     };
 
-    // Keep the first live mesh sample as the center of a merged stroke. Its
-    // disk contains the original disks, including those on thin UV islands.
+    // Try wide tiles first, then subdivide the samples that could not be
+    // merged. A merged stroke stays centered on a live mesh sample and its
+    // disk contains the fine strokes it replaces.
     template <typename Sample>
     std::vector<float> plan_brush_radii(const Texture& texture,
-                                        const std::vector<Sample>& samples,
-                                        float base_radius)
+                                       const std::vector<Sample>& samples,
+                                       float detail_radius,
+                                       double max_radius)
     {
         struct Tile
         {
-            std::size_t first;
-            double farthest_squared{0.0};
+            std::size_t representative;
+            double center_distance_squared;
+            double min_u;
+            double max_u;
+            double min_v;
+            double max_v;
             std::size_t count{1};
             float merged_radius{0.0f};
         };
 
-        const double tile_width = 2.0 * base_radius;
-        const auto tile_key = [tile_width](const Sample& sample) {
-            const auto x = static_cast<std::uint64_t>(sample.u / tile_width);
-            const auto y = static_cast<std::uint64_t>(sample.v / tile_width);
-            return (y << 32) | x;
-        };
         const auto valid_uv = [](const Sample& sample) {
             return sample.u >= 0.0 && sample.u <= 1.0 &&
                    sample.v >= 0.0 && sample.v <= 1.0;
         };
-
-        std::unordered_map<std::uint64_t, Tile> tiles;
-        for (std::size_t i = 0; i < samples.size(); ++i)
-        {
-            const auto& sample = samples[i];
-            if (!valid_uv(sample))
-            {
-                continue;
-            }
-            auto [it, inserted] = tiles.try_emplace(tile_key(sample), Tile{i});
-            if (!inserted)
-            {
-                auto& tile = it->second;
-                const auto& first = samples[tile.first];
-                const double du = sample.u - first.u;
-                const double dv = sample.v - first.v;
-                tile.farthest_squared = std::max(tile.farthest_squared, du * du + dv * dv);
-                ++tile.count;
-            }
-        }
-
         const double raster_margin = 0.5 / texture.size;
-        for (auto& entry : tiles)
+        std::vector<float> radii(samples.size(), detail_radius);
+        for (double tile_width = max_radius;
+             tile_width >= 2.0 * detail_radius;
+             tile_width *= 0.5)
         {
-            auto& tile = entry.second;
-            if (tile.count < 2)
+            const auto tile_key = [tile_width](const Sample& sample) {
+                const auto x = static_cast<std::uint64_t>(sample.u / tile_width);
+                const auto y = static_cast<std::uint64_t>(sample.v / tile_width);
+                return (y << 32) | x;
+            };
+            std::unordered_map<std::uint64_t, Tile> tiles;
+            for (std::size_t i = 0; i < samples.size(); ++i)
             {
-                continue;
+                const auto& sample = samples[i];
+                if (radii[i] != detail_radius || !valid_uv(sample))
+                {
+                    continue;
+                }
+                const auto key = tile_key(sample);
+                const double center_u = (static_cast<std::uint32_t>(key) + 0.5) * tile_width;
+                const double center_v = ((key >> 32) + 0.5) * tile_width;
+                const double du = sample.u - center_u;
+                const double dv = sample.v - center_v;
+                const double distance_squared = du * du + dv * dv;
+                auto [it, inserted] = tiles.try_emplace(key, Tile{
+                    i, distance_squared, sample.u, sample.u, sample.v, sample.v});
+                if (!inserted)
+                {
+                    auto& tile = it->second;
+                    ++tile.count;
+                    tile.min_u = std::min(tile.min_u, sample.u);
+                    tile.max_u = std::max(tile.max_u, sample.u);
+                    tile.min_v = std::min(tile.min_v, sample.v);
+                    tile.max_v = std::max(tile.max_v, sample.v);
+                    if (distance_squared < tile.center_distance_squared)
+                    {
+                        tile.representative = i;
+                        tile.center_distance_squared = distance_squared;
+                    }
+                }
             }
-            const auto& first = samples[tile.first];
-            const auto radius = static_cast<float>(
-                base_radius + std::sqrt(tile.farthest_squared) + raster_margin);
-            // Check both the enlarged footprint and the reach of neighboring
-            // original strokes so the merge cannot cross a color/material edge.
-            if (texture.is_uniform(first.u, first.v, radius + base_radius))
-            {
-                tile.merged_radius = radius;
-            }
-        }
 
-        std::vector<float> radii(samples.size(), base_radius);
-        for (std::size_t i = 0; i < samples.size(); ++i)
-        {
-            if (!valid_uv(samples[i]))
+            for (auto& entry : tiles)
             {
-                continue;
+                auto& tile = entry.second;
+                if (tile.count < 2)
+                {
+                    continue;
+                }
+                const auto& center = samples[tile.representative];
+                const double du = std::max(center.u - tile.min_u, tile.max_u - center.u);
+                const double dv = std::max(center.v - tile.min_v, tile.max_v - center.v);
+                const auto radius = static_cast<float>(
+                    detail_radius + std::hypot(du, dv) + raster_margin);
+                // Include the reach of fine strokes around the enlarged brush.
+                if (radius <= max_radius &&
+                    texture.is_uniform(center.u, center.v, radius + detail_radius))
+                {
+                    tile.merged_radius = radius;
+                }
             }
-            const auto& tile = tiles.find(tile_key(samples[i]))->second;
-            if (tile.merged_radius > 0.0f)
+
+            for (std::size_t i = 0; i < samples.size(); ++i)
             {
-                radii[i] = i == tile.first ? tile.merged_radius : 0.0f;
+                if (radii[i] != detail_radius || !valid_uv(samples[i]))
+                {
+                    continue;
+                }
+                const auto& tile = tiles.find(tile_key(samples[i]))->second;
+                if (tile.merged_radius > 0.0f)
+                {
+                    radii[i] = i == tile.representative ? tile.merged_radius : 0.0f;
+                }
             }
         }
         return radii;

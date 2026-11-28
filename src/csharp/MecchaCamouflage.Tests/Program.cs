@@ -5978,8 +5978,8 @@ static void NativeReplaySamplesMeshSurfacePlan()
         "replay must not use the 4-face image or canonical atlas");
     Assert(body.Contains("image_paint_brush_size_texels", StringComparison.Ordinal) &&
            body.Contains("replay_sample_spacing_texels", StringComparison.Ordinal) &&
-           body.Contains("brush_size_texels,", StringComparison.Ordinal),
-        "replay must use the Image brush size as the mesh sample density");
+           body.Contains("detail_brush_texels,", StringComparison.Ordinal),
+        "replay must generate a mesh sample grid at the detail brush density");
     Assert(!body.Contains("within_previous_color", StringComparison.Ordinal) &&
            !body.Contains("compression_threshold", StringComparison.Ordinal) &&
            !body.Contains("color_compression_enabled", StringComparison.Ordinal),

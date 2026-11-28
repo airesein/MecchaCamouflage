@@ -27,16 +27,18 @@ texture up front: only the gradually submitted strokes appear. When no raw
 paths are supplied, the bridge retains the current-game-texture fallback for
 backward compatibility and internal use.
 
-Replay uses the same runtime mesh surface sample/plan generation as Image Paint:
-the live mesh profile, the RuntimePaintable triangle cache, and the Image Paint
-sample density (the Image brush size) produce the mesh samples. It does not use
+Replay uses the same runtime mesh surface sample generation as Image Paint.
+The live mesh profile and RuntimePaintable triangle cache are sampled at 70%
+of the configured Image brush size, with a one-texel minimum. It does not use
 the 4-face image or the canonical atlas. Each mesh sample's UV indexes the saved
 raw albedo/PBR texture directly (no `v` flip) with edge-clamped bilinear
 sampling. Replay uses the raw albedo and PBR values also used by Preview and
 stamps them with a solid brush through `PaintAtUVWithBrush` on channel 7.
-It can merge neighboring strokes when an enlarged brush covers their original
+The planner tries wide tiles first and subdivides around color and material
+changes. A wider stroke replaces fine strokes only when it covers their
 footprints and the surrounding albedo and PBR texels have identical values.
-The response reports the number of saved submissions in `replay_strokes_merged`.
+The response reports `replay_strokes_merged`, `replay_detail_strokes`, and
+`replay_largest_brush_texels`.
 
 Preview locally imports the archive and preserves the pre-preview material
 snapshot through the existing Preview/Unpreview mechanism. Stop Preview restores

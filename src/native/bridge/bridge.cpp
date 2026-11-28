@@ -24412,10 +24412,9 @@ namespace
         std::vector<MeshFirstPlanSample> plan_samples{};
         MeshFirstPlanStats plan_stats{};
         std::string planner_failure{};
-        // Image Paint uses the Image brush size as its surface coverage step.
-        // Reuse Paint therefore emits one stroke per generated mesh sample
-        // instead of walking a texture-space grid, so UV islands and the mesh
-        // silhouette receive the same coverage as Image Paint.
+        // Start with a fine mesh grid so small strokes still cover the surface.
+        // The texture planner combines this coverage wherever a wider stroke fits.
+        const double detail_brush_texels = std::max(1.0, brush_size_texels * 0.7);
         const bool sample_gen_ok =
             mesh_first_generate_plan_samples_from_runtime_cache(
                 &profile,
@@ -24424,7 +24423,7 @@ namespace
                 camera_location,
                 camera_direction,
                 region_axis,
-                brush_size_texels,
+                detail_brush_texels,
                 plan_samples,
                 plan_stats,
                 planner_failure);
@@ -24434,7 +24433,7 @@ namespace
         metadata += ",\"replay_plan_samples\":" +
                     std::to_string(plan_samples.size());
         metadata += ",\"replay_sample_spacing_texels\":" +
-                    std::to_string(brush_size_texels);
+                    std::to_string(detail_brush_texels);
         if (!sample_gen_ok)
         {
             return response_json(false,
@@ -24455,20 +24454,21 @@ namespace
         // Use a solid brush so the active in-game tip cannot stamp it again.
         sdk::FRuntimeBrushSettings brush{};
         brush.Spacing = 1.0f;
-        const double brush_radius_uv =
-            static_cast<double>(brush_size_texels) /
-            static_cast<double>(std::max(1, active_texture_size));
-        brush.Radius = static_cast<float>(brush_radius_uv);
-        metadata += ",\"brush_radius_uv\":" + std::to_string(brush_radius_uv);
+        const double detail_radius_uv = detail_brush_texels / active_texture_size;
+        const double max_radius_uv = 8.0 * brush_size_texels / active_texture_size;
+        brush.Radius = static_cast<float>(detail_radius_uv);
+        metadata += ",\"brush_radius_uv\":" + std::to_string(detail_radius_uv);
 
         const auto texture =
             paint_texture_replay::Texture{texture_size, albedo.bytes, packed_pbr.bytes};
-        const auto brush_radii =
-            paint_texture_replay::plan_brush_radii(texture, plan_samples, brush.Radius);
+        const auto brush_radii = paint_texture_replay::plan_brush_radii(
+            texture, plan_samples, brush.Radius, max_radius_uv);
 
         std::vector<sdk::FPaintStroke> strokes{};
         strokes.reserve(plan_samples.size());
         std::size_t merged_strokes = 0;
+        std::size_t detail_strokes = 0;
+        float largest_radius = 0.0f;
         for (std::size_t sample_index = 0;
              sample_index < plan_samples.size();
              ++sample_index)
@@ -24491,6 +24491,8 @@ namespace
             }
             auto stroke_brush = brush;
             stroke_brush.Radius = stroke_radius;
+            detail_strokes += stroke_radius == brush.Radius;
+            largest_radius = std::max(largest_radius, stroke_radius);
             // Export and Preview use the game texture's raw channels and UVs.
             const auto channels = texture.sample(sample.u, sample.v);
             const auto channel = sdk_make_channel(
@@ -24506,6 +24508,9 @@ namespace
         }
         metadata += ",\"replay_strokes_total\":" + std::to_string(strokes.size());
         metadata += ",\"replay_strokes_merged\":" + std::to_string(merged_strokes);
+        metadata += ",\"replay_detail_strokes\":" + std::to_string(detail_strokes);
+        metadata += ",\"replay_largest_brush_texels\":" +
+                    std::to_string(largest_radius * active_texture_size);
         metadata += ",\"replay_alpha_skipping\":false";
         metadata += ",\"local_paint_rpc\":\"PaintAtUVWithBrush\"";
         metadata += ",\"local_route_mode\":\"native_recorded_paint\"";
